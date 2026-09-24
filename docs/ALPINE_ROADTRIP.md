@@ -1,7 +1,7 @@
 # Alpine Roadtrip — multi-map session
 
-**Status (2026-09-18):** first hard switch Hahntennjoch ↔ Fernpass is in the repo.  
-Not yet: segment-time UI, driving-time countdown, more than two gates, traffic, vehicle damage.
+**Status (2026-09-24):** in-game maps and portals, expected traffic from the game clock.  
+Not yet: segment-time UI, driving-time countdown, live AI vehicles, vehicle damage.
 
 The maps are built in [terrain-worker](https://github.com/decnet100/terrainWorker). This repo only owns the session mod and the portal inject.
 
@@ -97,6 +97,7 @@ Anti ping-pong: arrival sits ~20 m further **into the map** than the destination
 - Red, **very** transparent TSStatic box, `collisionType: None`, 12×8×6 m. Logic = Lua OBB.
 - While the vehicle is in a **built-in** box: 20 m-wide ballistic arc toward the **DGM bbox centre of the destination map** (full CRS distance, end at `center_z_m` in the current map’s Z scale). `visibleDistance` is raised for that (template otherwise 7.5 km). Later the same mesh sits in front of the backdrop panorama from terrain-worker (`docs/BACKDROP.md`). User-made gates use the in-game sky arrow described under [Adding maps in-game](#adding-maps-in-game).
 - HUD app **Alpine Roadtrip Map**: weather + traffic icons sit on each **map centre** (not the portals). The loaded map has no stack. Portal wait is the distance between the two map centres in km as seconds, then rolled from destination-map traffic (low ±25 %, medium 100–150 %, heavy 150–200 %). Leave and re-enter rolls again.
+- Expected traffic is not live AI, and the app does not show the clock. One session seed comes from the UTC start time (`YYYYMMDDHHMM`). Density then follows the in-game clock (BeamNG `TimeOfDay`, 24×: one real hour is one game day). Weekend waves (Friday afternoon, Saturday, Sunday return) and a nationwide German holiday envelope multiply the value. Summer (1 Jul–15 Aug) is the strongest inbound boost. This is not 16 Bundesland calendars — only the typical travel windows that fill Alpine roads.
 - Background map: `build_portals` / `tools/fetch_overview_basemap.py` pulls [basemap.at](https://basemap.at/) WMTS tiles (CC-BY 4.0), warps them onto `map.bbox` in EPSG:31254, and writes `basemap.png` plus a world file (`.pgw`). `image_aspect` grows that box to landscape so a wide HUD fills. The app crops a view matching the window aspect (all portal marks stay visible). Same aspect, larger window: same region, more pixels. Attribution: „Datenquelle: basemap.at“.
 
 | Gate | from | to | Box (BeamNG m) |

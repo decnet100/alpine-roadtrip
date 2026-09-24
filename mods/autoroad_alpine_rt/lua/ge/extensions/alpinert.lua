@@ -8,7 +8,7 @@ local SESSION_PATH = "settings/alpine_rt/session.json"
 local GRAPH_PATH = "settings/alpine_rt/graph.json"
 local PORTALS_PATH = "/lua/ge/extensions/alpinert/portals.json"
 -- Bump this when Lua changes; shown on load so a stale in-memory copy is obvious.
-local LUA_REV = "2026-09-24a"
+local LUA_REV = "2026-09-24b"
 -- 24x: 1 real hour = 1 game day (radio hour = 150 s). Weather tick stays UDW's real-time clock.
 local DAY_LENGTH_S = 3600
 
@@ -1095,13 +1095,288 @@ local function ensureLiveArc(gate)
   return true
 end
 
+-- BeamNG TimeOfDay.time: 0=noon, 0.25=sunset, 0.5=midnight, 0.75=sunrise.
+local function todToHour(t)
+  t = tonumber(t)
+  if t == nil then
+    return 12
+  end
+  return (t * 24 + 12) % 24
+end
+
+local function readTodFraction()
+  if core_environment and core_environment.getTimeOfDay then
+    local tod = core_environment.getTimeOfDay()
+    if type(tod) == "table" and type(tod.time) == "number" then
+      return tod.time % 1
+    end
+  end
+  if core_environment and core_environment.getState then
+    local t = envTime(core_environment.getState())
+    if t ~= nil then
+      return t % 1
+    end
+  end
+  return nil
+end
+
+local function parseYmd(s)
+  local y, m, d = tostring(s or ""):match("^(%d%d%d%d)%-(%d%d)%-(%d%d)")
+  if not y then
+    local now = os.date("!*t")
+    return now.year, now.month, now.day
+  end
+  return tonumber(y), tonumber(m), tonumber(d)
+end
+
+local function isLeap(y)
+  return y % 4 == 0 and (y % 100 ~= 0 or y % 400 == 0)
+end
+
+local MONTH_DAYS = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+
+local function addDays(y, m, d, n)
+  d = d + (n or 0)
+  while d < 1 do
+    m = m - 1
+    if m < 1 then
+      m = 12
+      y = y - 1
+    end
+    local dim = MONTH_DAYS[m]
+    if m == 2 and isLeap(y) then
+      dim = 29
+    end
+    d = d + dim
+  end
+  while true do
+    local dim = MONTH_DAYS[m]
+    if m == 2 and isLeap(y) then
+      dim = 29
+    end
+    if d <= dim then
+      break
+    end
+    d = d - dim
+    m = m + 1
+    if m > 12 then
+      m = 1
+      y = y + 1
+    end
+  end
+  return y, m, d
+end
+
+-- 0=Sunday … 6=Saturday (Sakamoto).
+local function weekdaySun0(y, m, d)
+  local t = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 }
+  local yy = y
+  if m < 3 then
+    yy = yy - 1
+  end
+  return (yy + math.floor(yy / 4) - math.floor(yy / 100) + math.floor(yy / 400) + t[m] + d) % 7
+end
+
+local function easterYmd(y)
+  local a = y % 19
+  local b = math.floor(y / 100)
+  local c = y % 100
+  local d = math.floor(b / 4)
+  local e = b % 4
+  local f = math.floor((b + 8) / 25)
+  local g = math.floor((b - f + 1) / 3)
+  local h = (19 * a + b - d - g + 15) % 30
+  local i = math.floor(c / 4)
+  local k = c % 4
+  local l = (32 + 2 * e + 2 * i - h - k) % 7
+  local n = math.floor((a + 11 * h + 22 * l) / 451)
+  local month = math.floor((h + l - 7 * n + 114) / 31)
+  local day = ((h + l - 7 * n + 114) % 31) + 1
+  return month, day
+end
+
+local function ymdNum(m, d)
+  return m * 100 + d
+end
+
+local function daysBetween(y1, m1, d1, y2, m2, d2)
+  local function absDay(y, m, d)
+    local v = d
+    for i = 1, m - 1 do
+      v = v + MONTH_DAYS[i]
+      if i == 2 and isLeap(y) then
+        v = v + 1
+      end
+    end
+    v = v + (y - 2000) * 365 + math.floor((y - 2000 + 3) / 4)
+    return v
+  end
+  return absDay(y2, m2, d2) - absDay(y1, m1, d1)
+end
+
+-- Nationwide-ish DE travel windows, not every Bundesland calendar.
+local function holidayFactor(y, m, d)
+  local md = ymdNum(m, d)
+  local em, ed = easterYmd(y)
+  local fromEaster = daysBetween(y, em, ed, y, m, d)
+  if md >= 701 and md <= 815 then
+    return 1.85, "Sommerferien"
+  end
+  if md >= 626 and md <= 630 then
+    return 1.45, "Sommerferien"
+  end
+  if md >= 816 and md <= 910 then
+    return 1.45, "Sommerferien"
+  end
+  if md >= 1220 or md <= 106 then
+    return 1.65, "Weihnachten"
+  end
+  if md >= 210 and md <= 305 then
+    return 1.50, "Winterferien"
+  end
+  if fromEaster >= -8 and fromEaster <= 2 then
+    return 1.50, "Ostern"
+  end
+  if fromEaster >= 46 and fromEaster <= 52 then
+    return 1.35, "Pfingsten"
+  end
+  if md >= 1010 and md <= 1026 then
+    return 1.30, "Herbstferien"
+  end
+  if md == 501 or md == 1003 or md == 1101 then
+    return 1.35, "Feiertag"
+  end
+  return 1.0, nil
+end
+
+local function weekendFactor(wd, hour)
+  if wd == 5 and hour >= 14 then
+    return 1.40
+  end
+  if wd == 6 then
+    if hour >= 10 and hour < 18 then
+      return 1.40
+    end
+    return 1.25
+  end
+  if wd == 0 then
+    if hour >= 12 and hour < 20 then
+      return 1.45
+    end
+    return 1.15
+  end
+  return 1.0
+end
+
+local function diurnalFactor(hour)
+  if hour >= 22 or hour < 6 then
+    return 0.32
+  end
+  if hour < 10 then
+    return 0.90
+  end
+  if hour < 16 then
+    return 1.00
+  end
+  if hour < 19 then
+    return 1.15
+  end
+  return 0.70
+end
+
+local function gameClock(session)
+  session = session or {}
+  session.world = session.world or {}
+  local w = session.world
+  if not w.calendar_start then
+    local started = tostring(session.started_at or "")
+    w.calendar_start = started:match("^(%d%d%d%d%-%d%d%-%d%d)") or os.date("!%Y-%m-%d")
+  end
+  w.game_day = tonumber(w.game_day) or 0
+  local tod = readTodFraction()
+  if tod == nil then
+    tod = 0
+  end
+  local sy, sm, sd = parseYmd(w.calendar_start)
+  local y, mo, d = addDays(sy, sm, sd, w.game_day)
+  local hour = todToHour(tod)
+  local wd = weekdaySun0(y, mo, d)
+  local hol = holidayFactor(y, mo, d)
+  local wee = weekendFactor(wd, hour)
+  local dia = diurnalFactor(hour)
+  return {
+    year = y,
+    month = mo,
+    day = d,
+    hour = hour,
+    weekday = wd,
+    tod = tod,
+    game_day = w.game_day,
+    holiday = hol,
+    weekend = wee,
+    diurnal = dia,
+  }
+end
+
+local function hash01(text, seed, extra)
+  local h = 0
+  local s = tostring(text or "") .. ":" .. tostring(seed or 0) .. ":" .. tostring(extra or 0)
+  for i = 1, #s do
+    h = (h * 131 + string.byte(s, i)) % 2147483647
+  end
+  return (h % 10000) / 10000.0
+end
+
+local function playTimeSeed(session)
+  local started = tostring((session and session.started_at) or "")
+  local y, m, d, H, M = started:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d)")
+  if y then
+    return tonumber(y .. m .. d .. H .. M)
+  end
+  return os.time()
+end
+
+local function stampWorld(session)
+  session = session or {}
+  session.world = session.world or {}
+  local w = session.world
+  w.clock_rate = 24
+  w.day_length_s = DAY_LENGTH_S
+  if not w.calendar_start then
+    local started = tostring(session.started_at or "")
+    w.calendar_start = started:match("^(%d%d%d%d%-%d%d%-%d%d)") or os.date("!%Y-%m-%d")
+  end
+  w.game_day = tonumber(w.game_day) or 0
+  return w
+end
+
+local function tickGameCalendar(session)
+  session = session or {}
+  local w = stampWorld(session)
+  local tod = readTodFraction()
+  if tod == nil then
+    return session
+  end
+  local last = tonumber(w.last_tod)
+  local wrap = last ~= nil and tod + 0.35 < last
+  if wrap then
+    w.game_day = (tonumber(w.game_day) or 0) + 1
+  end
+  w.last_tod = tod
+  if wrap then
+    writeSession(session)
+    log("I", "alpine_rt", string.format("game day -> %s (tod wrap)", tostring(w.game_day)))
+  end
+  return session
+end
+
 local function ensureSession(session)
   session = session or readSession() or {}
   if not session.session_id then
     session.session_id = tostring(os.time()) .. "-" .. tostring(math.random(10000, 99999))
     session.started_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
     session.segments = session.segments or {}
-    session.traffic = session.traffic or { epoch = os.time(), seed = math.random(100000, 999999) }
+    session.traffic = session.traffic or { epoch = os.time(), seed = playTimeSeed(session) }
   end
   return session
 end
@@ -1109,7 +1384,7 @@ end
 local function ensureTraffic()
   local session = ensureSession()
   if type(session.traffic) ~= "table" then
-    session.traffic = { epoch = os.time(), seed = math.random(100000, 999999) }
+    session.traffic = { epoch = os.time(), seed = playTimeSeed(session) }
     writeSession(session)
     return session.traffic.epoch, session.traffic.seed, session
   end
@@ -1122,7 +1397,7 @@ local function ensureTraffic()
     changed = true
   end
   if not seed then
-    seed = math.random(100000, 999999)
+    seed = playTimeSeed(session)
     session.traffic.seed = seed
     changed = true
   end
@@ -1208,8 +1483,20 @@ local function classifyWeatherSim(mapId, tSec, seed)
   return "sun"
 end
 
-local function mapDensity(levelId, tSec, seed)
-  return segDensity(tostring(levelId or ""), tSec, seed)
+local function mapDensity(levelId, clock, seed)
+  clock = clock or gameClock()
+  local bucket = math.floor((tonumber(clock.hour) or 12) * 4)
+  local day = tonumber(clock.game_day) or 0
+  local noise = hash01(tostring(levelId or ""), seed, day * 100 + bucket)
+  local base = 0.20 + 0.34 * noise
+  local bias = 0.85 + 0.30 * hash01("bias:" .. tostring(levelId or ""), seed, 0)
+  local v = base * bias * (clock.diurnal or 1) * (clock.weekend or 1) * (clock.holiday or 1)
+  if v < 0 then
+    v = 0
+  elseif v > 1 then
+    v = 1
+  end
+  return v
 end
 
 local function dwellBaseS(gate)
@@ -1221,10 +1508,10 @@ local function dwellBaseS(gate)
 end
 
 -- New roll every time the player enters a box. Leave + re-enter is allowed to repeat.
-local function rollDwellNeed(gate, tSec, seed)
+local function rollDwellNeed(gate, clock, seed)
   local base = dwellBaseS(gate)
   local dest = gate and gate.to_level
-  local cls = classifyTraffic(mapDensity(dest, tSec, seed))
+  local cls = classifyTraffic(mapDensity(dest, clock, seed))
   local u = math.random()
   local need
   if cls == "clear" then
@@ -1241,7 +1528,9 @@ local function rollDwellNeed(gate, tSec, seed)
 end
 
 local function getTrafficMap()
-  local epoch, seed = ensureTraffic()
+  local epoch, seed, session = ensureTraffic()
+  tickGameCalendar(session)
+  local clock = gameClock(session)
   local t = os.time() - (epoch or os.time())
   local level = currentLevel()
   local snap = snapshotEnvironment()
@@ -1253,8 +1542,8 @@ local function getTrafficMap()
     local b = gateById(r.b)
     local mark = r.map_mark
     if type(mark) == "table" and type(mark.crs) == "table" and #mark.crs >= 2 then
-      local da = a and mapDensity(a.to_level, t, seed) or nil
-      local db = b and mapDensity(b.to_level, t, seed) or nil
+      local da = a and mapDensity(a.to_level, clock, seed) or nil
+      local db = b and mapDensity(b.to_level, clock, seed) or nil
       roads[#roads + 1] = {
         id = tostring(r.id or r.a or ""),
         mark = mark,
@@ -1266,7 +1555,7 @@ local function getTrafficMap()
   local maps = {}
   local levels = (portals.map and portals.map.levels) or {}
   for id, rec in pairs(levels) do
-    local dens = mapDensity(id, t, seed)
+    local dens = mapDensity(id, clock, seed)
     local wx = (id == level) and hereWeather or classifyWeatherSim(id, t, seed)
     maps[#maps + 1] = {
       id = tostring(id),
@@ -1298,7 +1587,7 @@ local function queueSwitch(gate)
   local session = ensureSession()
   session.settings = settings
   session.udw = snapshotUdw()
-  session.world = { clock_rate = 24, day_length_s = DAY_LENGTH_S }
+  stampWorld(session)
   session.vehicle = vehicle
   session.pending_restore = {
     to_level = gate.to_level,
@@ -1473,7 +1762,7 @@ local function onClientEndMission()
   if session then
     session.settings = snapshotEnvironment()
     session.udw = snapshotUdw()
-    session.world = { clock_rate = 24, day_length_s = DAY_LENGTH_S }
+    stampWorld(session)
     writeSession(session)
   end
   worldReady = false
@@ -1551,10 +1840,11 @@ local function onUpdate(dtReal)
     dwellGate = inside
     dwellAcc = 0
     lastMsgS = -1
-    local epoch, seed = ensureTraffic()
-    local t = os.time() - (epoch or os.time())
+    local _, seed, session = ensureTraffic()
+    tickGameCalendar(session)
+    local clock = gameClock(session)
     local cls, base
-    dwellNeed, cls, base = rollDwellNeed(inside, t, seed)
+    dwellNeed, cls, base = rollDwellNeed(inside, clock, seed)
     log("I", "alpine_rt", string.format(
       "enter %s need=%.1fs base=%.1fs traffic=%s dest=%s rev=%s",
       tostring(inside.id),
