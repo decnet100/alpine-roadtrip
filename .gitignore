@@ -1,0 +1,11 @@
+__pycache__/
+.venv/
+*.pyc
+
+# basemap.at tile cache
+data/raw/
+
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

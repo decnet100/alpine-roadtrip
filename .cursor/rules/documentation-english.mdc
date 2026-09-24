@@ -1,0 +1,13 @@
+---
+description: Write all documentation in English
+alwaysApply: true
+---
+
+# Documentation language
+
+Write documentation in English. This includes `README` files, everything under `docs/`, design notes, and explanatory comments that are really documentation.
+
+- New and updated documentation is English.
+- Do not add German prose when editing those files.
+- Leave license attributions and quoted UI strings unchanged (for example basemap.at „Datenquelle: basemap.at“).
+- Replies in chat follow the user's language. The files stay English.
