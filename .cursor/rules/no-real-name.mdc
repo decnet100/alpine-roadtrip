@@ -1,0 +1,14 @@
+---
+description: Published text uses the decnet100 handle
+alwaysApply: true
+---
+
+# Handle
+
+The README, docs, comments, and path examples name a person only as the handle `decnet100`.
+
+Any other personal name, email address, or Windows user folder in those places is replaced with `decnet100`.
+
+```text
+cd C:\Users\decnet100\Documents\privat\alpine-roadtrip
+```
