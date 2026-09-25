@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
   <asset>
-    <contributor><authoring_tool>beamng_autoroad build_portals</authoring_tool></contributor>
+    <contributor><authoring_tool>alpine-roadtrip build_portals</authoring_tool></contributor>
     <unit name="meter" meter="1"/>
     <up_axis>Z_UP</up_axis>
   </asset>
@@ -10,9 +10,9 @@
       <profile_COMMON>
         <technique sid="common">
           <lambert>
-            <diffuse><color>1.0 0.22 0.16 0.16</color></diffuse>
+            <diffuse><color>1.0 0.22 0.16 0.05</color></diffuse>
             <transparent opaque="A_ONE"><color>1 1 1 1</color></transparent>
-            <transparency><float>0.84</float></transparency>
+            <transparency><float>0.95</float></transparency>
           </lambert>
         </technique>
       </profile_COMMON>

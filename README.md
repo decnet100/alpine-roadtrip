@@ -1,6 +1,6 @@
 # Alpine Roadtrip
 
-BeamNG.drive mod: drive one alpine pass, linger in a portal, and hard-switch to the next map. Time of day, weather, and the vehicle config stay with the session.
+BeamNG.drive mod: drive one alpine pass, linger in a portal, and hard-switch to the next map. Time of day and the vehicle config stay with the session. The weather icon on the destination map is applied after the switch. A temporary traffic table spawns vehicles on Fernpass, Imst, and Reschen; see the concept doc.
 
 The maps themselves are built by [terrain-worker](https://github.com/decnet100/terrainWorker). This repo is only the session: portal graph, GE extension, HUD, and the tools that inject the gates into those levels.
 

@@ -8,7 +8,7 @@ local SESSION_PATH = "settings/alpine_rt/session.json"
 local GRAPH_PATH = "settings/alpine_rt/graph.json"
 local PORTALS_PATH = "/lua/ge/extensions/alpinert/portals.json"
 -- Bump this when Lua changes; shown on load so a stale in-memory copy is obvious.
-local LUA_REV = "2026-09-24b"
+local LUA_REV = "2026-09-24k"
 -- 24x: 1 real hour = 1 game day (radio hour = 150 s). Weather tick stays UDW's real-time clock.
 local DAY_LENGTH_S = 3600
 
@@ -19,12 +19,22 @@ local dwellGate = nil
 local dwellAcc = 0
 local dwellNeed = 0
 local lastMsgS = -1
+local dwellMsgHold = 0
 local graceUntil = 0
 local switchQueued = nil
 local worldReady = false
 local restoreArmed = false
 local restoreTries = 0
 local udwResumeLeft = nil
+local trafficSpawnedFor = nil
+local trafficWait = 0
+-- Temporary test. Kauns is the Reschen level. Densities also drive the map colours and the portal wait.
+local TEST_TRAFFIC = {
+  -- cars = pool. active = how many of those run physics at once (BeamNG slider tops out at 15).
+  autoroad_fernpass_8192 = { dens = 0.90, cars = 100, active = 15 },
+  autoroad_imst_8192 = { dens = 0.22, cars = 3 },
+  autoroad_reschen_8192 = { dens = 0.55, cars = 8 },
+}
 -- UV Rotate Animation on the rotor material; Lua spin stays off.
 local FAN_RPM = 0
 local FAN_RAD_PER_S = FAN_RPM * math.pi / 30
@@ -436,13 +446,13 @@ local function ensureUserArc(gate)
     pts[#pts + 1] = {
       pos[1] + dx * u,
       pos[2] + dy * u,
-      pos[3] + 1.5 + 4 * peak * u * (1 - u),
+      pos[3] + 4.5 + 4 * peak * u * (1 - u),
     }
   end
   local inv = 1 / math.max(length_m, 1)
   gate.arc = {
     points = pts,
-    width_m = 20,
+    width_m = 15,
     length_m = length_m,
     generated = true,
     heading = { dx * inv, dy * inv },
@@ -992,7 +1002,7 @@ local function drawGateArc(gate)
   end
   local col = ColorF(1.0, 0.35, 0.22, 1.0)
   local colDim = ColorF(1.0, 0.35, 0.22, 0.35)
-  local w = tonumber(arc.width_m) or 20
+  local w = tonumber(arc.width_m) or 15
   local hw = w * 0.5
   for i = 1, #arc.points - 1 do
     local a = arc.points[i]
@@ -1483,7 +1493,15 @@ local function classifyWeatherSim(mapId, tSec, seed)
   return "sun"
 end
 
+local function testTraffic(levelId)
+  return TEST_TRAFFIC[tostring(levelId or "")]
+end
+
 local function mapDensity(levelId, clock, seed)
+  local fixed = testTraffic(levelId)
+  if fixed then
+    return fixed.dens
+  end
   clock = clock or gameClock()
   local bucket = math.floor((tonumber(clock.hour) or 12) * 4)
   local day = tonumber(clock.game_day) or 0
@@ -1527,6 +1545,136 @@ local function rollDwellNeed(gate, clock, seed)
   return need, cls, base
 end
 
+-- Same classes the map icon uses. The icon is a forecast; the level does not carry it.
+local FORECAST_SKY = {
+  sun = { cloud = 0.08, drops = 0, fog = 0.00002 },
+  clouds = { cloud = 0.72, drops = 0, fog = 0.00005 },
+  rain = { cloud = 0.92, drops = 2800, fog = 0.00014, block = "rain_drop" },
+  snow = { cloud = 0.86, drops = 1600, fog = 0.00020, block = "snow_drop" },
+}
+
+local function storedForecast(session, level)
+  local rec = session and session.applied_weather
+  if type(rec) ~= "table" or not rec.kind then
+    return nil
+  end
+  if level and rec.level and rec.level ~= level then
+    return nil
+  end
+  return rec.kind
+end
+
+local function forecastFor(levelId)
+  local epoch, seed = ensureTraffic()
+  local t = os.time() - (epoch or os.time())
+  return classifyWeatherSim(levelId, t, seed)
+end
+
+local function ensurePrecip(spec)
+  local obj = getObject and getObject("Precipitation") or nil
+  if spec.drops <= 0 then
+    if obj then
+      obj.numOfDrops = 0
+    end
+    return
+  end
+  if obj then
+    obj.numOfDrops = spec.drops
+    if spec.block then
+      pcall(function() obj:setField("dataBlock", 0, spec.block) end)
+    end
+    return
+  end
+  if not createObject then
+    log("W", "alpine_rt", "no Precipitation object; rain and snow stay dry")
+    return
+  end
+  obj = createObject("Precipitation")
+  if not obj then
+    return
+  end
+  obj.canSave = false
+  local block = spec.block or "rain_drop"
+  local function arm(name)
+    obj:setField("dataBlock", 0, name)
+    obj.numOfDrops = spec.drops
+    obj.boxWidth = 220
+    obj.dropSize = (name == "snow_drop") and 1.5 or 0.7
+    obj.minSpeed = (name == "snow_drop") and 0.4 or 1.2
+    obj.maxSpeed = (name == "snow_drop") and 1.0 or 2.2
+    obj.followCam = 1
+    obj:registerObject("Precipitation")
+  end
+  local ok = pcall(arm, block)
+  if not ok and block ~= "rain_drop" then
+    ok = pcall(arm, "rain_drop")
+    block = "rain_drop"
+  end
+  if not ok then
+    log("W", "alpine_rt", "Precipitation register failed")
+    return
+  end
+  local grp = scenetree and (scenetree.findObject("sky_and_sun") or scenetree.findObject("MissionGroup"))
+  if grp and grp.addObject then
+    pcall(function() grp:addObject(obj) end)
+  end
+  log("I", "alpine_rt", "Precipitation " .. tostring(block) .. " drops " .. tostring(spec.drops))
+end
+
+-- Universal Dynamic Weather owns the sky while its panel is loaded. Writing cloud cover
+-- through core_environment makes 0.39 put the map default back, and UDW then heals
+-- fog and clouds to its own preset every couple of seconds.
+local UDW_PRESET = {
+  sun = "clear",
+  clouds = "overcast",
+  rain = "rain",
+  snow = "rain",
+}
+
+local function dropStrayPrecip()
+  local o = scenetree and scenetree.findObject and scenetree.findObject("Precipitation")
+  if o and o.delete then
+    pcall(function() o:delete() end)
+  end
+end
+
+local function applyForecast(kind)
+  local spec = FORECAST_SKY[kind]
+  if not spec then
+    return
+  end
+  local jbw = ensureJbWeather()
+  local udwName = UDW_PRESET[kind]
+  if jbw and jbw.setPreset and udwName then
+    udwResumeLeft = nil
+    if jbw.stopForecast then
+      pcall(jbw.stopForecast)
+    end
+    dropStrayPrecip()
+    pcall(jbw.setPreset, udwName, 6)
+    log("I", "alpine_rt", "forecast weather " .. tostring(kind) .. " via UDW " .. udwName)
+    return
+  end
+  if core_environment then
+    pcall(function()
+      if core_environment.setCloudCover then
+        core_environment.setCloudCover(spec.cloud)
+      end
+      if core_environment.setFogDensity then
+        core_environment.setFogDensity(spec.fog)
+      end
+      if core_environment.setPrecipitation then
+        core_environment.setPrecipitation(spec.drops)
+      end
+    end)
+  end
+  local ok, err = pcall(ensurePrecip, spec)
+  if not ok then
+    log("W", "alpine_rt", "forecast precip " .. tostring(err))
+  end
+  log("I", "alpine_rt", "forecast weather " .. tostring(kind))
+end
+
 local function getTrafficMap()
   local epoch, seed, session = ensureTraffic()
   tickGameCalendar(session)
@@ -1535,7 +1683,7 @@ local function getTrafficMap()
   local level = currentLevel()
   local snap = snapshotEnvironment()
   local env = snap and snap.environment or nil
-  local hereWeather = classifyWeather(env)
+  local hereWeather = storedForecast(session, level) or classifyWeather(env)
   local roads = {}
   for _, r in ipairs(portals.roads or {}) do
     local a = gateById(r.a)
@@ -1547,6 +1695,7 @@ local function getTrafficMap()
       roads[#roads + 1] = {
         id = tostring(r.id or r.a or ""),
         mark = mark,
+        route = type(r.route_crs) == "table" and r.route_crs[1] and r.route_crs or nil,
         a = a and { id = tostring(a.id or r.a), to_level = a.to_level, density = da } or nil,
         b = b and { id = tostring(b.id or r.b), to_level = b.to_level, density = db } or nil,
       }
@@ -1584,7 +1733,8 @@ end
 local function queueSwitch(gate)
   local settings = snapshotEnvironment()
   local vehicle = snapshotVehicle()
-  local session = ensureSession()
+  local _, _, session = ensureTraffic()
+  local wx = forecastFor(gate.to_level)
   session.settings = settings
   session.udw = snapshotUdw()
   stampWorld(session)
@@ -1593,9 +1743,10 @@ local function queueSwitch(gate)
     to_level = gate.to_level,
     from_gate = gate.id,
     arrive = gate.arrive,
+    weather = wx,
   }
   writeSession(session)
-  log("I", "alpine_rt", "Queued switch " .. tostring(gate.from_level) .. " -> " .. tostring(gate.to_level))
+  log("I", "alpine_rt", "Queued switch " .. tostring(gate.from_level) .. " -> " .. tostring(gate.to_level) .. " weather " .. tostring(wx))
   switchQueued = {
     to_level = gate.to_level,
     vehicle = vehicle,
@@ -1627,7 +1778,12 @@ local function applyPendingRestore()
   if not session or not session.pending_restore then
     if isAlpineRoadtripLevel() then
       applyClock(session and session.settings and session.settings.environment)
-      applyUdw(session and session.udw)
+      local kind = storedForecast(session, currentLevel())
+      if kind then
+        applyForecast(kind)
+      else
+        applyUdw(session and session.udw)
+      end
     end
     restoreArmed = false
     restoreTries = 0
@@ -1656,7 +1812,12 @@ local function applyPendingRestore()
     end
   end
   teleportToArrive(pending.arrive)
-  applyUdw(session.udw)
+  if pending.weather then
+    applyForecast(pending.weather)
+    session.applied_weather = { level = pending.to_level or level, kind = pending.weather }
+  else
+    applyUdw(session.udw)
+  end
   session.pending_restore = nil
   writeSession(session)
   local grace = tonumber(portals.grace_s) or 8
@@ -1770,11 +1931,67 @@ local function onClientEndMission()
   dwellAcc = 0
   dwellNeed = 0
   udwResumeLeft = nil
+  trafficSpawnedFor = nil
+  trafficWait = 0
   fanRotors = nil
   hideAllArcs()
 end
 
-local function onUpdate(dtReal)
+local function navgraphReady()
+  -- map.nodes is not the road graph. The graph lives behind map.getMap().
+  if not (map and map.getMap) then
+    return false
+  end
+  local graph = map.getMap()
+  if not (graph and graph.nodes) then
+    return false
+  end
+  local n = 0
+  for _ in pairs(graph.nodes) do
+    n = n + 1
+    if n >= 4 then
+      return true
+    end
+  end
+  return false
+end
+
+local function ensureTestTraffic(level)
+  if trafficSpawnedFor == level or not playerVehicle() then
+    return
+  end
+  local spec = testTraffic(level)
+  if not spec then
+    return
+  end
+  if not navgraphReady() then
+    trafficWait = trafficWait + 1
+    if trafficWait == 300 then
+      log("W", "alpine_rt", "navgraph still empty, traffic not spawned")
+    end
+    return
+  end
+  if not (gameplay_traffic and gameplay_traffic.setupTraffic) and extensions and extensions.load then
+    pcall(extensions.load, "gameplay_traffic")
+  end
+  if not (gameplay_traffic and gameplay_traffic.setupTraffic) then
+    trafficSpawnedFor = level
+    log("W", "alpine_rt", "gameplay_traffic missing")
+    return
+  end
+  trafficSpawnedFor = level
+  local ok, err = pcall(function()
+    gameplay_traffic.setupTraffic(spec.cars, { activeAmount = spec.active or spec.cars })
+  end)
+  if ok then
+    log("I", "alpine_rt", "test traffic " .. tostring(level) .. " cars=" .. tostring(spec.cars) .. " active=" .. tostring(spec.active or spec.cars))
+    uiMsg("Traffic " .. tostring(spec.cars), 4)
+  else
+    log("W", "alpine_rt", "test traffic failed " .. tostring(err))
+  end
+end
+
+local function onUpdate(dtReal, dtSim)
   if switchQueued then
     doQueuedSwitch()
     return
@@ -1798,6 +2015,7 @@ local function onUpdate(dtReal)
   if not level then
     return
   end
+  ensureTestTraffic(level)
   pcall(drawUserPortals, level)
   if graceUntil > now() then
     hideAllArcs()
@@ -1829,6 +2047,7 @@ local function onUpdate(dtReal)
     dwellAcc = 0
     dwellNeed = 0
     lastMsgS = -1
+    dwellMsgHold = 0
     return
   end
 
@@ -1840,6 +2059,7 @@ local function onUpdate(dtReal)
     dwellGate = inside
     dwellAcc = 0
     lastMsgS = -1
+    dwellMsgHold = 0
     local _, seed, session = ensureTraffic()
     tickGameCalendar(session)
     local clock = gameClock(session)
@@ -1862,18 +2082,32 @@ local function onUpdate(dtReal)
     drawGateArc(inside)
   end
 
-  dwellAcc = dwellAcc + (dtReal or 0)
+  -- dtSim is 0 while physics is paused, and follows slow motion. dtReal keeps running.
+  local simDt = dtSim
+  if simDt == nil then
+    simDt = dtReal or 0
+  end
+  local paused = simDt < 0.00001
+  if paused then
+    dwellMsgHold = dwellMsgHold - (dtReal or 0)
+  else
+    dwellAcc = dwellAcc + simDt
+    dwellMsgHold = 0
+  end
   local need = dwellNeed
   if need <= 0 then
     need = dwellBaseS(inside)
   end
   local remain = math.max(0, need - dwellAcc)
   local sec = math.ceil(remain)
-  if sec ~= lastMsgS then
+  if sec ~= lastMsgS or (paused and dwellMsgHold <= 0 and remain > 0.05) then
+    if paused then
+      dwellMsgHold = 0.4
+    end
     lastMsgS = sec
     local label = inside.label or inside.id
     if remain > 0.05 then
-      uiMsg(string.format("%s — switching in %ds", label, sec), 1.05)
+      uiMsg(string.format("%s — switching in %ds", label, sec), paused and 0.5 or 1.05)
     end
   end
 

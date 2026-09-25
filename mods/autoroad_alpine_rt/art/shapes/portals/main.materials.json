@@ -13,7 +13,7 @@
           0.2,
           1.0
         ],
-        "opacityFactor": 0.14,
+        "opacityFactor": 0.05,
         "emissiveFactor": [
           0.0,
           0.0,
@@ -48,7 +48,7 @@
           0.2,
           1.0
         ],
-        "opacityFactor": 0.35,
+        "opacityFactor": 0.8,
         "emissiveFactor": [
           0.0,
           0.0,

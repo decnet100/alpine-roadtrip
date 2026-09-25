@@ -137,6 +137,200 @@ def _portal_abs_z(site: dict, beamng_z: float) -> float:
     return _from_z_min(site) + float(beamng_z)
 
 
+def _normalize_via(raw_road: dict) -> tuple[str, list[tuple[float, float]]] | None:
+    """WGS84 via points as (lat, lon), ordered along one gate of this road."""
+    spec = raw_road.get("via_wgs84")
+    if not spec:
+        return None
+    a_id = str(raw_road.get("a") or raw_road.get("forward") or "")
+    b_id = str(raw_road.get("b") or raw_road.get("reverse") or "")
+    if isinstance(spec, list):
+        along = a_id
+        points_raw = spec
+    else:
+        along = str(spec.get("along") or a_id)
+        points_raw = spec.get("points") or []
+    if not points_raw:
+        return None
+    rid = raw_road.get("id") or a_id
+    if along not in (a_id, b_id):
+        raise SystemExit(f"Road {rid}: via_wgs84.along {along!r} is not gate a or b")
+    points: list[tuple[float, float]] = []
+    for item in points_raw:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            raise SystemExit(f"Road {rid}: via_wgs84 point must be [lat, lon]")
+        lat, lon = float(item[0]), float(item[1])
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise SystemExit(f"Road {rid}: via_wgs84 out of range ({lat}, {lon})")
+        points.append((lat, lon))
+    return along, points
+
+
+def _dest_portal_pos(gates: list, gate: dict) -> tuple[float, float, float] | None:
+    """Opposite gate's box, in that map's BeamNG metres. None if the return gate is missing."""
+    src = str(gate.get("from_level") or "")
+    dst = str(gate.get("to_level") or "")
+    for other in gates:
+        if str(other.get("from_level") or "") != dst or str(other.get("to_level") or "") != src:
+            continue
+        pos = (other.get("box") or {}).get("pos") or []
+        if len(pos) < 3:
+            return None
+        return float(pos[0]), float(pos[1]), float(pos[2])
+    return None
+
+
+def _wgs84_to_named_crs(crs: str, lat: float, lon: float) -> tuple[float, float]:
+    from pyproj import Transformer
+
+    to_crs = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    x, y = to_crs.transform(float(lon), float(lat))
+    return float(x), float(y)
+
+
+def _route_crs(raw_road: dict, a: dict, b: dict | None, map_cfg: dict) -> list[list[float]] | None:
+    """Overview polyline in map CRS, ordered from gate a's portal to gate b's portal."""
+    if b is None:
+        return None
+    a_crs = (a.get("map_mark") or {}).get("crs")
+    b_crs = (b.get("map_mark") or {}).get("crs")
+    if not a_crs or not b_crs or len(a_crs) < 2 or len(b_crs) < 2:
+        return None
+    crs_name = str(map_cfg.get("crs") or "EPSG:31254")
+    controls: list[tuple[float, float]] = [(float(a_crs[0]), float(a_crs[1]))]
+    parsed = _normalize_via(raw_road)
+    if parsed:
+        along, points = parsed
+        ordered = points if along == str(a.get("id")) else list(reversed(points))
+        for lat, lon in ordered:
+            x, y = _wgs84_to_named_crs(crs_name, lat, lon)
+            if math.hypot(x - controls[-1][0], y - controls[-1][1]) < 40.0:
+                continue
+            controls.append((x, y))
+    end = (float(b_crs[0]), float(b_crs[1]))
+    if math.hypot(end[0] - controls[-1][0], end[1] - controls[-1][1]) < 40.0:
+        controls[-1] = end
+    else:
+        controls.append(end)
+    if len(controls) < 2:
+        return None
+    if len(controls) == 2:
+        xy = controls
+    else:
+        chord = 0.0
+        for i in range(len(controls) - 1):
+            chord += math.hypot(
+                controls[i + 1][0] - controls[i][0],
+                controls[i + 1][1] - controls[i][1],
+            )
+        n = min(160, max(24, int(chord / 250.0)))
+        xy = _smooth_xy(controls, n)
+    return [[round(x, 1), round(y, 1)] for x, y in xy]
+
+
+def _via_by_gate(raw_roads: list) -> dict[str, list[tuple[float, float]]]:
+    """Travel-order WGS84 points for each gate. The opposite gate is reversed."""
+    out: dict[str, list[tuple[float, float]]] = {}
+    for road in raw_roads or []:
+        parsed = _normalize_via(road)
+        if not parsed:
+            continue
+        along, points = parsed
+        a_id = str(road.get("a") or road.get("forward") or "")
+        b_id = str(road.get("b") or road.get("reverse") or "")
+        out[along] = points
+        other = b_id if along == a_id else a_id
+        if other:
+            out[other] = list(reversed(points))
+    return out
+
+
+def _wgs84_to_beamng(site: dict, lat: float, lon: float) -> tuple[float, float]:
+    from pyproj import Transformer
+
+    sc = SiteCoords(site)
+    to_crs = Transformer.from_crs("EPSG:4326", sc.crs, always_xy=True)
+    x, y = to_crs.transform(float(lon), float(lat))
+    return sc.crs_to_beamng(float(x), float(y))
+
+
+def _catmull_rom(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+    t: float,
+) -> tuple[float, float]:
+    t2 = t * t
+    t3 = t2 * t
+    def axis(i: int) -> float:
+        return 0.5 * (
+            (2.0 * p1[i])
+            + (-p0[i] + p2[i]) * t
+            + (2.0 * p0[i] - 5.0 * p1[i] + 4.0 * p2[i] - p3[i]) * t2
+            + (-p0[i] + 3.0 * p1[i] - 3.0 * p2[i] + p3[i]) * t3
+        )
+    return axis(0), axis(1)
+
+
+def _smooth_xy(
+    controls: list[tuple[float, float]],
+    samples: int,
+) -> list[tuple[float, float]]:
+    """Curve through every control, including the portal and the destination."""
+    if len(controls) < 3:
+        return list(controls)
+    spans: list[float] = []
+    total = 0.0
+    for i in range(len(controls) - 1):
+        d = math.hypot(
+            controls[i + 1][0] - controls[i][0],
+            controls[i + 1][1] - controls[i][1],
+        )
+        spans.append(max(d, 1.0))
+        total += spans[-1]
+    padded = [controls[0], *controls, controls[-1]]
+    out: list[tuple[float, float]] = [controls[0]]
+    for i, span in enumerate(spans):
+        steps = max(2, int(round(samples * span / total)))
+        p0, p1, p2, p3 = padded[i], padded[i + 1], padded[i + 2], padded[i + 3]
+        for s in range(1, steps + 1):
+            out.append(_catmull_rom(p0, p1, p2, p3, s / steps))
+    return out
+
+
+def _lift_hump(
+    xy: list[tuple[float, float]],
+    z0: float,
+    z1: float,
+    peak_m: float,
+) -> tuple[list[list[float]], float]:
+    dist = [0.0]
+    for i in range(1, len(xy)):
+        dist.append(
+            dist[-1]
+            + math.hypot(xy[i][0] - xy[i - 1][0], xy[i][1] - xy[i - 1][1])
+        )
+    total = dist[-1] or 1.0
+    pts: list[list[float]] = []
+    for i, (x, y) in enumerate(xy):
+        u = dist[i] / total
+        z = z0 + u * (z1 - z0) + 4.0 * peak_m * u * (1.0 - u)
+        pts.append([round(x, 3), round(y, 3), round(z, 3)])
+    return pts, total
+
+
+def _max_plan_offset_m(points: list[list[float]]) -> float:
+    ax, ay = points[0][0], points[0][1]
+    bx, by = points[-1][0], points[-1][1]
+    dx, dy = bx - ax, by - ay
+    length = math.hypot(dx, dy) or 1.0
+    worst = 0.0
+    for p in points:
+        worst = max(worst, abs((p[0] - ax) * dy - (p[1] - ay) * dx) / length)
+    return worst
+
+
 def _ballistic_points(
     start: tuple[float, float, float],
     dir_xy: tuple[float, float],
@@ -169,6 +363,8 @@ def compute_gate_arc(
     arc_cfg: dict,
     *,
     target_z_override: float | None = None,
+    via_wgs84: list[tuple[float, float]] | None = None,
+    dest_portal: tuple[float, float, float] | None = None,
 ) -> dict | None:
     if from_site is None or to_site is None:
         return None
@@ -177,34 +373,80 @@ def compute_gate_arc(
     px, py, pz = box["pos"]
     portal_crs = sc.beamng_to_crs(px, py)
     dest_crs = _bbox_center_crs(to_site)
-    heading_crs = (dest_crs[0] - portal_crs[0], dest_crs[1] - portal_crs[1])
-    geo_d = math.hypot(heading_crs[0], heading_crs[1]) or 1.0
-    dbx = heading_crs[0] * (sc.terrain_extent / sc.bw)
-    dby = heading_crs[1] * (sc.terrain_extent / sc.bh)
-    dx, dy = _norm2(dbx, dby)
-    length_full = math.hypot(dbx, dby)
-    # Optional cap for tests; default = full CRS span to dest bbox center.
+    dest_abs = _site_center_abs_z(to_site, None)
+    # 1.5 m clears the deck. Another 3 m keeps the wire off the vehicle.
+    start = (px, py, pz + 4.5)
+    end_kind = "center"
+    if dest_portal is not None:
+        dbx, dby, dbz = dest_portal
+        dest_sc = SiteCoords(to_site)
+        crs_x, crs_y = dest_sc.beamng_to_crs(dbx, dby)
+        end_bx, end_by = sc.crs_to_beamng(crs_x, crs_y)
+        end_kind = "portal"
+        if target_z_override is not None:
+            end_z = float(target_z_override) - _from_z_min(from_site)
+        else:
+            end_z = _portal_abs_z(to_site, dbz) - _from_z_min(from_site)
+    else:
+        end_bx, end_by = sc.crs_to_beamng(*dest_crs)
+        if target_z_override is not None:
+            end_z = float(target_z_override) - _from_z_min(from_site)
+        else:
+            end_z = dest_abs - _from_z_min(from_site)
+    span_x, span_y = end_bx - px, end_by - py
+    length_full = math.hypot(span_x, span_y) or 1.0
+    dx, dy = _norm2(span_x, span_y)
+    end_crs = sc.beamng_to_crs(end_bx, end_by)
+    geo_d = math.hypot(end_crs[0] - portal_crs[0], end_crs[1] - portal_crs[1]) or 1.0
+    # Optional cap for tests; default = span to the chosen end.
     length_m = float(arc_cfg["length_m"]) if arc_cfg.get("length_m") is not None else length_full
     length_m = max(50.0, length_m)
     peak_frac = float(arc_cfg.get("peak_frac") if arc_cfg.get("peak_frac") is not None else 0.06)
     peak_min = float(arc_cfg.get("peak_height_m") if arc_cfg.get("peak_height_m") is not None else 400)
     peak_m = max(peak_min, peak_frac * length_m)
-    width_m = float(arc_cfg.get("width_m") or 20)
+    width_m = float(arc_cfg.get("width_m") or 15)
     samples = int(arc_cfg.get("samples") or max(48, int(length_m / 350.0)))
-    dest_abs = _site_center_abs_z(to_site, target_z_override)
-    # Dest GHA expressed in *this* map's BeamNG Z (same origin as the portal).
-    end_z = dest_abs - _from_z_min(from_site)
-    start = (px, py, pz + 1.5)
-    z_end_delta = end_z - start[2]
-    points = _ballistic_points(
-        start,
-        (dx, dy),
-        length_m=length_m,
-        peak_m=peak_m,
-        z_end_delta=z_end_delta,
-        samples=samples,
-    )
-    return {
+    via_out: list[list[float]] = []
+    bend_m = 0.0
+    if via_wgs84 and from_site is not None:
+        controls: list[tuple[float, float]] = [(px, py)]
+        for lat, lon in via_wgs84:
+            bx, by = _wgs84_to_beamng(from_site, lat, lon)
+            if math.hypot(bx - controls[-1][0], by - controls[-1][1]) < 40.0:
+                continue
+            controls.append((bx, by))
+            via_out.append([round(lat, 6), round(lon, 6)])
+        if math.hypot(end_bx - controls[-1][0], end_by - controls[-1][1]) < 40.0:
+            controls[-1] = (end_bx, end_by)
+        else:
+            controls.append((end_bx, end_by))
+        if len(controls) >= 3:
+            chord = 0.0
+            for i in range(len(controls) - 1):
+                chord += math.hypot(
+                    controls[i + 1][0] - controls[i][0],
+                    controls[i + 1][1] - controls[i][1],
+                )
+            peak_m = max(peak_min, peak_frac * chord)
+            n = max(int(samples), int(chord / 200.0))
+            n = min(max(n, 8), 240)
+            xy = _smooth_xy(controls, n)
+            points, length_m = _lift_hump(xy, start[2], end_z, peak_m)
+            dx, dy = _norm2(points[1][0] - points[0][0], points[1][1] - points[0][1])
+            bend_m = _max_plan_offset_m(points)
+        else:
+            via_out = []
+    if not via_out:
+        z_end_delta = end_z - start[2]
+        points = _ballistic_points(
+            start,
+            (dx, dy),
+            length_m=length_m,
+            peak_m=peak_m,
+            z_end_delta=z_end_delta,
+            samples=samples,
+        )
+    arc = {
         "width_m": width_m,
         "length_m": round(length_m, 1),
         "peak_height_m": round(peak_m, 1),
@@ -212,9 +454,14 @@ def compute_gate_arc(
         "dest_center_crs": [round(dest_crs[0], 1), round(dest_crs[1], 1)],
         "dest_center_z_m": round(dest_abs, 1),
         "end_z_beamng": round(end_z, 2),
+        "end": end_kind,
         "geo_distance_m": round(geo_d, 1),
         "points": points,
     }
+    if via_out:
+        arc["via_wgs84"] = via_out
+        arc["bend_m"] = round(bend_m, 1)
+    return arc
 
 
 def _rot_matrix_along(tx: float, ty: float) -> list[float]:
@@ -267,6 +514,7 @@ def load_portals_yaml(path: Path | None = None) -> dict:
     arc_cfg = dict(data.get("arc") or {})
     map_cfg = dict(data.get("map") or {})
     sites = _sites_by_level()
+    via_by_gate = _via_by_gate(data.get("roads") or [])
     out_gates = []
     for g in gates:
         box = dict(g.get("box") or {})
@@ -305,14 +553,20 @@ def load_portals_yaml(path: Path | None = None) -> dict:
             sites.get(gate["to_level"]),
             arc_cfg,
             target_z_override=float(z_over) if z_over is not None else None,
+            via_wgs84=via_by_gate.get(gate["id"]),
+            dest_portal=_dest_portal_pos(gates, gate),
         )
         if arc:
             arc["object"] = f"alpine_rt_arc_{gate['id']}"
             gate["arc"] = arc
+            via_n = len(arc.get("via_wgs84") or [])
+            bend = arc.get("bend_m")
+            bend_s = f" bend={bend:.0f}m" if bend is not None else ""
             print(
                 f"Arc {gate['id']}: heading={arc['heading']} "
-                f"geo={arc['geo_distance_m']:.0f}m peak={arc['peak_height_m']:.0f}m "
-                f"dest_z={arc['dest_center_z_m']}"
+                f"geo={arc['geo_distance_m']:.0f}m path={arc['length_m']:.0f}m "
+                f"peak={arc['peak_height_m']:.0f}m end={arc.get('end')} "
+                f"z={arc['end_z_beamng']} via={via_n}{bend_s}"
             )
         else:
             print(f"Arc {gate['id']}: skipped (missing site YAML for level)")
@@ -575,7 +829,20 @@ def _road_payload(raw_road: dict, a: dict, b: dict | None, map_cfg: dict) -> dic
         road["weather"] = str(raw_road["weather"])
     if raw_road.get("alert") is not None:
         road["alert"] = bool(raw_road["alert"])
-    print(f"Road {road['id']}: a={road['a']} b={road['b']} mark={road.get('map_mark')}")
+    parsed_via = _normalize_via(raw_road)
+    if parsed_via:
+        along, points = parsed_via
+        road["via_wgs84"] = {
+            "along": along,
+            "points": [[round(lat, 6), round(lon, 6)] for lat, lon in points],
+        }
+    route = _route_crs(raw_road, a, b, map_cfg)
+    if route:
+        road["route_crs"] = route
+    print(
+        f"Road {road['id']}: a={road['a']} b={road['b']} "
+        f"mark={road.get('map_mark')} route={len(route) if route else 0}"
+    )
     return road
 
 
@@ -784,7 +1051,7 @@ def write_cube_dae(path: Path) -> None:
         faces,
         mat=MAT_NAME,
         lod_name="portal_cube_a999",
-        rgba=(1.0, 0.22, 0.16, 0.16),
+        rgba=(1.0, 0.22, 0.16, 0.05),
         toward="centroid",
     )
 
@@ -905,13 +1172,68 @@ def _write_mesh_dae(
     path.write_text(xml, encoding="utf-8", newline="\n")
 
 
+def _add_quad(
+    verts: list[tuple[float, float, float]],
+    faces: list[tuple[int, int, int]],
+    p00: tuple[float, float, float],
+    p10: tuple[float, float, float],
+    p11: tuple[float, float, float],
+    p01: tuple[float, float, float],
+) -> None:
+    i = len(verts)
+    verts.extend((p00, p10, p11, p01))
+    faces.append((i, i + 1, i + 2))
+    faces.append((i, i + 2, i + 3))
+
+
+def _add_wire(
+    verts: list[tuple[float, float, float]],
+    faces: list[tuple[int, int, int]],
+    poly: list[tuple[float, float, float]],
+    thickness_m: float,
+) -> None:
+    """Two crossed strips along poly so the wire reads from the side and from above."""
+    ht = max(0.15, float(thickness_m) * 0.5)
+    for i in range(len(poly) - 1):
+        a = poly[i]
+        b = poly[i + 1]
+        rx, ry = _norm2(-(b[1] - a[1]), b[0] - a[0])
+
+        def shift(p: tuple[float, float, float], side: float, z: float) -> tuple[float, float, float]:
+            return (p[0] + rx * side, p[1] + ry * side, p[2] + z)
+
+        _add_quad(
+            verts,
+            faces,
+            shift(a, ht, 0.0),
+            shift(b, ht, 0.0),
+            shift(b, -ht, 0.0),
+            shift(a, -ht, 0.0),
+        )
+        _add_quad(
+            verts,
+            faces,
+            shift(a, 0.0, ht),
+            shift(b, 0.0, ht),
+            shift(b, 0.0, -ht),
+            shift(a, 0.0, -ht),
+        )
+
+
 def write_arc_ribbon_dae(path: Path, points: list[list[float]], width_m: float) -> None:
-    """Ribbon in world metres, origin at first point (TSStatic position = start)."""
+    """Wireframe of the sampled centerline. Origin at the first point.
+
+    Left rail, right rail, spine, and a crossbar at each sample. A later curve
+    only changes how `points` are produced.
+    """
     if len(points) < 2:
         return
     hw = max(0.5, float(width_m) * 0.5)
+    wire_m = 1.6
     sx, sy, sz = points[0]
-    verts: list[tuple[float, float, float]] = []
+    left: list[tuple[float, float, float]] = []
+    right: list[tuple[float, float, float]] = []
+    spine: list[tuple[float, float, float]] = []
     for i, p in enumerate(points):
         if i < len(points) - 1:
             tx, ty = points[i + 1][0] - p[0], points[i + 1][1] - p[1]
@@ -919,21 +1241,23 @@ def write_arc_ribbon_dae(path: Path, points: list[list[float]], width_m: float) 
             tx, ty = p[0] - points[i - 1][0], p[1] - points[i - 1][1]
         rx, ry = _norm2(-ty, tx)
         lx, ly, lz = p[0] - sx, p[1] - sy, p[2] - sz
-        verts.append((lx - rx * hw, ly - ry * hw, lz))
-        verts.append((lx + rx * hw, ly + ry * hw, lz))
+        spine.append((lx, ly, lz))
+        left.append((lx - rx * hw, ly - ry * hw, lz))
+        right.append((lx + rx * hw, ly + ry * hw, lz))
+    verts: list[tuple[float, float, float]] = []
     faces: list[tuple[int, int, int]] = []
-    nseg = len(points) - 1
-    for i in range(nseg):
-        a, b, c, d = i * 2, i * 2 + 1, i * 2 + 2, i * 2 + 3
-        faces.append((a, c, b))
-        faces.append((b, c, d))
+    _add_wire(verts, faces, left, wire_m)
+    _add_wire(verts, faces, right, wire_m)
+    _add_wire(verts, faces, spine, wire_m)
+    for i in range(len(spine)):
+        _add_wire(verts, faces, [left[i], spine[i], right[i]], wire_m)
     _write_mesh_dae(
         path,
         verts,
         faces,
         mat="portal_arc",
         lod_name="portal_arc_a999",
-        rgba=(1.0, 0.40, 0.28, 0.18),
+        rgba=(1.0, 0.40, 0.28, 0.85),
         toward="plus_z",
     )
 
@@ -983,14 +1307,14 @@ def portal_material_dict(tex_dir: str = "") -> dict:
             "a11e7101-71e0-4ead-b100-0000ffffff71",
             f"{prefix}portal_ghost.png",
             roughness=0.85,
-            opacity=0.14,
+            opacity=0.05,
         ),
         "portal_arc": _translucent_mat(
             "portal_arc",
             "a11e7101-71e0-4ead-b100-0000ffffff72",
             f"{prefix}portal_arc.png",
             roughness=0.9,
-            opacity=0.35,
+            opacity=0.8,
         ),
     }
 
@@ -1021,7 +1345,7 @@ def ensure_mod_art(
             write_arc_ribbon_dae(
                 art / f"portal_arc_{g['id']}.dae",
                 pts,
-                float(arc.get("width_m") or 20),
+                float(arc.get("width_m") or 15),
             )
     write_portal_material(art / "main.materials.json", "/art/shapes/portals")
     write_overview_basemap(cfg, force=force_basemap, skip=skip_basemap)

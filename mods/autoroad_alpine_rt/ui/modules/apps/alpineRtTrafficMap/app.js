@@ -1,4 +1,4 @@
-﻿// Alpine Roadtrip Map (Traffic Overlay)
+// Alpine Roadtrip Map (Traffic Overlay)
 // UI App: renders a simple map-like polyline view with low/medium/high traffic colouring.
 angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
   var tpl = ''
@@ -160,6 +160,16 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
         if (e < minX) minX = e; if (e > maxX) maxX = e;
         if (n < minY) minY = n; if (n > maxY) maxY = n;
       }
+      var route = roads[i].route;
+      if (route) {
+        for (var r = 0; r < route.length; r++) {
+          var p = route[r];
+          if (!p || p.length < 2) continue;
+          var re = Number(p[0]), rn = Number(p[1]);
+          if (re < minX) minX = re; if (re > maxX) maxX = re;
+          if (rn < minY) minY = rn; if (rn > maxY) maxY = rn;
+        }
+      }
     }
     if (!isFinite(minX)) return imageBBox(state, zoomed);
     return [minX - 800, minY - 800, maxX + 800, maxY + 800];
@@ -258,7 +268,57 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     ctx.globalAlpha = 1.0;
   }
 
+  function offsetPoly(pts, dist) {
+    var out = [];
+    for (var i = 0; i < pts.length; i++) {
+      var prev = pts[Math.max(0, i - 1)];
+      var next = pts[Math.min(pts.length - 1, i + 1)];
+      var u = unit2(next[0] - prev[0], next[1] - prev[1]);
+      var rx = -u[1];
+      var ry = u[0];
+      out.push([pts[i][0] + rx * dist, pts[i][1] + ry * dist]);
+    }
+    return out;
+  }
+
+  function strokePoly(ctx, pts, color) {
+    if (!pts || pts.length < 2) return;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+    ctx.lineWidth = 6.5;
+    ctx.globalAlpha = 0.4;
+    ctx.stroke();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3.6;
+    ctx.globalAlpha = 0.95;
+    ctx.stroke();
+    ctx.globalAlpha = 1.0;
+  }
+
+  function drawRouteLanes(ctx, toXY, road, state) {
+    var route = road.route;
+    if (!route || route.length < 2) return false;
+    var pts = [];
+    for (var i = 0; i < route.length; i++) {
+      var p = route[i];
+      if (!p || p.length < 2) continue;
+      pts.push(toXY(Number(p[0]), Number(p[1])));
+    }
+    if (pts.length < 2) return false;
+    var side = (state.map && state.map.driving_side) ? String(state.map.driving_side).toLowerCase() : 'right';
+    var flip = side === 'left' ? -1 : 1;
+    var half = 3.5;
+    if (road.a) strokePoly(ctx, offsetPoly(pts, half * flip), colFor(road.a.density));
+    if (road.b) strokePoly(ctx, offsetPoly(pts, -half * flip), colFor(road.b.density));
+    return true;
+  }
+
   function drawCarriageway(ctx, toXY, road, state) {
+    if (drawRouteLanes(ctx, toXY, road, state)) return;
     var mark = pickMark(road, state, state._zoomed);
     if (!mark || !mark.crs || mark.crs.length < 2) return;
     if (hideOnCurrentMap(mark, state, state._zoomed)) return;
