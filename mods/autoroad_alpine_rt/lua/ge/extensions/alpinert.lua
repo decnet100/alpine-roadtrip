@@ -6,14 +6,17 @@ local M = {}
 
 local SESSION_PATH = "settings/alpine_rt/session.json"
 local GRAPH_PATH = "settings/alpine_rt/graph.json"
+local REGION_DIR = "settings/alpine_rt/regions"
 local PORTALS_PATH = "/lua/ge/extensions/alpinert/portals.json"
 -- Bump this when Lua changes; shown on load so a stale in-memory copy is obvious.
-local LUA_REV = "2026-09-24k"
--- 24x: 1 real hour = 1 game day (radio hour = 150 s). Weather tick stays UDW's real-time clock.
+local LUA_REV = "2026-10-24b"
+-- Label used only when no TimeOfDay exists yet. 3600 s is 24× (one real hour, one game day).
+-- 0.40's live cycle is time / play / dayLength. Do not force this over Freeroam or a level.
 local DAY_LENGTH_S = 3600
 
 local portals = { grace_s = 8, gates = {} }
 local userLocations = {}
+local userLinks = {}
 local mergeUserGraph
 local dwellGate = nil
 local dwellAcc = 0
@@ -21,18 +24,28 @@ local dwellNeed = 0
 local lastMsgS = -1
 local dwellMsgHold = 0
 local graceUntil = 0
+local freshPortal = { id = nil, untilT = 0 }
 local switchQueued = nil
+local carry = { conditions = nil, ready = false, token = 0, requested = 0, hold = nil, damage = nil, damageTries = 0 }
 local worldReady = false
 local restoreArmed = false
 local restoreTries = 0
 local udwResumeLeft = nil
 local trafficSpawnedFor = nil
+local waterStageFor = nil
+local waterStageLevel = nil
+local waterStageMonth = nil
+local waterFileLevel = nil
+local waterFileData = nil
+-- Discoverable portals found this process. Not written to the session file.
+local discoveredPortals = {}
+local discoverNoticeUntil = 0
 local trafficWait = 0
 -- Temporary test. Kauns is the Reschen level. Densities also drive the map colours and the portal wait.
 local TEST_TRAFFIC = {
   -- cars = pool. active = how many of those run physics at once (BeamNG slider tops out at 15).
   autoroad_fernpass_8192 = { dens = 0.90, cars = 100, active = 15 },
-  autoroad_imst_8192 = { dens = 0.22, cars = 3 },
+  imst_tarrenz = { dens = 0.22, cars = 3 },
   autoroad_reschen_8192 = { dens = 0.55, cars = 8 },
 }
 -- UV Rotate Animation on the rotor material; Lua spin stays off.
@@ -43,6 +56,43 @@ local fanAngle = 0
 
 local function now()
   return os.clock()
+end
+
+-- BeamNG's level identifier is often the folder name in lower case
+-- (timmelsjoch_2048). portals.json and saved gates keep the folder spelling.
+local function canonicalLevel(id)
+  if type(id) ~= "string" or id == "" then
+    return nil
+  end
+  local levels = portals.map and portals.map.levels
+  if levels and levels[id] then
+    return id
+  end
+  if userLocations[id] then
+    return id
+  end
+  local lower = id:lower()
+  if levels then
+    for key in pairs(levels) do
+      if type(key) == "string" and key:lower() == lower then
+        return key
+      end
+    end
+  end
+  for key in pairs(userLocations) do
+    if type(key) == "string" and key:lower() == lower then
+      return key
+    end
+  end
+  for _, g in ipairs(portals.gates or {}) do
+    if type(g.from_level) == "string" and g.from_level:lower() == lower then
+      return g.from_level
+    end
+    if type(g.to_level) == "string" and g.to_level:lower() == lower then
+      return g.to_level
+    end
+  end
+  return id
 end
 
 local function currentLevel()
@@ -58,7 +108,7 @@ local function currentLevel()
   if slash then
     id = id:sub(1, slash - 1)
   end
-  return id
+  return canonicalLevel(id)
 end
 
 local function jsonClone(v)
@@ -187,28 +237,36 @@ local function wgs84ToGkWest(latDeg, lonDeg)
   return x, y - 5000000
 end
 
+-- EPSG:3857 spherical mercator. Matches OSM and basemap.at google3857 tiles.
+local MERCATOR_R = 6378137.0
+
+local function wgs84ToWebMercator(latDeg, lonDeg)
+  local lat = math.max(-85.05112878, math.min(85.05112878, latDeg))
+  local x = MERCATOR_R * math.rad(lonDeg)
+  local y = MERCATOR_R * math.log(math.tan(math.pi * 0.25 + math.rad(lat) * 0.5))
+  return x, y
+end
+
+-- Web mercator metres are stretched by 1/cos(lat). This brings a northing back to ground scale.
+local function webMercatorGroundScale(northing)
+  local lat = 2 * math.atan(math.exp(northing / MERCATOR_R)) - math.pi * 0.5
+  local c = math.cos(lat)
+  if c < 0.05 then
+    c = 0.05
+  end
+  return c
+end
+
 local function projectToAuthority(lat, lon, authority)
+  if authority == "EPSG:3857" then
+    local e, n = wgs84ToWebMercator(lat, lon)
+    return e, n, nil
+  end
   if authority == "EPSG:31254" then
     local e, n = wgs84ToGkWest(lat, lon)
     return e, n, nil
   end
   return nil, nil, "Map CRS authority " .. tostring(authority) .. " is not supported. This map was not added."
-end
-
-local function overviewBBox()
-  local b = portals.map and portals.map.bbox
-  if type(b) ~= "table" or b[4] == nil then
-    return nil
-  end
-  return b
-end
-
-local function inOverview(e, n)
-  local b = overviewBBox()
-  if not b or not e or not n then
-    return false
-  end
-  return e >= b[1] and e <= b[3] and n >= b[2] and n <= b[4]
 end
 
 local function centerOf(levelId)
@@ -251,13 +309,22 @@ end
 local function readGraph()
   local data = jsonReadFile(GRAPH_PATH)
   if type(data) ~= "table" then
-    return { locations = {}, gates = {} }
+    return { locations = {}, gates = {}, view = {}, links = {}, moves = {} }
   end
   if type(data.locations) ~= "table" then
     data.locations = {}
   end
   if type(data.gates) ~= "table" then
     data.gates = {}
+  end
+  if type(data.view) ~= "table" then
+    data.view = {}
+  end
+  if type(data.links) ~= "table" then
+    data.links = {}
+  end
+  if type(data.moves) ~= "table" then
+    data.moves = {}
   end
   return data
 end
@@ -281,12 +348,64 @@ local function reloadPortals()
   dwellGate = nil
 end
 
+local titleCache = {}
+
 local function levelTitle(id)
-  local info = jsonReadFile("/levels/" .. tostring(id) .. "/info.json")
-  if type(info) == "table" and type(info.title) == "string" and info.title ~= "" then
-    return info.title
+  id = tostring(id or "")
+  if id == "" then
+    return ""
   end
-  return tostring(id)
+  if titleCache[id] then
+    return titleCache[id]
+  end
+  local function translated(key)
+    if type(key) ~= "string" or key == "" or not core_locales or not core_locales.translate then
+      return nil
+    end
+    local text = core_locales.translate(key, "")
+    if type(text) == "string" and text ~= "" and text ~= key then
+      return text
+    end
+    return nil
+  end
+  local function remember(text)
+    titleCache[id] = text
+    return text
+  end
+  local info = jsonReadFile("/levels/" .. id .. "/info.json")
+  local raw = type(info) == "table" and type(info.title) == "string" and info.title or ""
+  local fromRaw = translated(raw)
+  if fromRaw then
+    return remember(fromRaw)
+  end
+  local fromKey = translated("levels." .. id .. ".info.title")
+  if fromKey then
+    return remember(fromKey)
+  end
+  if raw ~= "" and not raw:find("^levels%.", 1) and not raw:find("{{", 1, true) then
+    return remember(raw)
+  end
+  local short = id:gsub("^autoroad_", ""):gsub("_%d+$", ""):gsub("_", " ")
+  if short == "" then
+    return id
+  end
+  return short:sub(1, 1):upper() .. short:sub(2)
+end
+
+local function destName(gate)
+  local id = gate and gate.to_level
+  if not id then
+    return "the next map"
+  end
+  local title = levelTitle(id)
+  if type(title) == "string" and title ~= "" and not title:find("^autoroad_") then
+    return title
+  end
+  local short = tostring(id):gsub("^autoroad_", ""):gsub("_%d+$", "")
+  if short == "" then
+    return tostring(id)
+  end
+  return short:sub(1, 1):upper() .. short:sub(2)
 end
 
 local function vehiclePose()
@@ -333,7 +452,7 @@ local function publishLocation(levelId, loc)
   portals.map = portals.map or {}
   portals.map.levels = portals.map.levels or {}
   local rec = portals.map.levels[levelId] or {}
-  if loc and type(loc.crs) == "table" and inOverview(loc.crs[1], loc.crs[2]) then
+  if loc and type(loc.crs) == "table" and loc.crs[1] and loc.crs[2] then
     rec.crs = { loc.crs[1], loc.crs[2] }
   end
   if loc and loc.name then
@@ -367,20 +486,74 @@ local function addUserRoads()
       if rev then
         used[rev.id] = true
       end
-      local e1, n1 = centerOf(g.from_level)
-      local e2, n2 = centerOf(g.to_level)
-      if e1 and e2 and inOverview(e1, n1) and inOverview(e2, n2) then
+      local lo, hi = g.from_level, g.to_level
+      if lo > hi then
+        lo, hi = hi, lo
+      end
+      local e1, n1 = centerOf(lo)
+      local e2, n2 = centerOf(hi)
+      if e1 and e2 then
+        local route = { { e1, n1 } }
+        for _, link in ipairs(userLinks) do
+          if link.a == lo and link.b == hi and type(link.via) == "table" then
+            for _, p in ipairs(link.via) do
+              if type(p) == "table" and tonumber(p[1]) and tonumber(p[2]) then
+                route[#route + 1] = { tonumber(p[1]), tonumber(p[2]) }
+              end
+            end
+            break
+          end
+        end
+        route[#route + 1] = { e2, n2 }
         portals.roads[#portals.roads + 1] = {
           id = "user:" .. tostring(g.id),
           a = g.id,
           b = rev and rev.id or nil,
+          user = true,
+          ends = { lo, hi },
           map_mark = {
             crs = { (e1 + e2) * 0.5, (n1 + n2) * 0.5 },
             heading = { e2 - e1, n2 - n1 },
             length_px = 28,
             gap_px = 7,
           },
+          route_crs = route,
         }
+      end
+    end
+  end
+end
+
+local function applyGateMoves(moves)
+  if type(moves) ~= "table" then
+    return
+  end
+  for id, move in pairs(moves) do
+    if type(id) == "string" and type(move) == "table" then
+      for _, g in ipairs(portals.gates or {}) do
+        if g.id == id then
+          if type(move.pos) == "table" and move.pos[1] then
+            local old = g.box and g.box.pos
+            local size = (g.box and g.box.size) or { BOX_SIZE[1], BOX_SIZE[2], BOX_SIZE[3] }
+            if type(old) == "table" and old[1] then
+              g.moveDelta = {
+                move.pos[1] - old[1],
+                move.pos[2] - old[2],
+                move.pos[3] - (old[3] or move.pos[3]),
+              }
+            end
+            g.box = {
+              pos = { move.pos[1], move.pos[2], move.pos[3] },
+              tangent = type(move.tangent) == "table" and move.tangent or (g.box and g.box.tangent) or { 1, 0 },
+              size = size,
+            }
+            g.moved = true
+          end
+          if type(move.arrive) == "table" and type(move.arrive.pos) == "table" then
+            g.arrive = move.arrive
+          end
+          break
+        end
       end
     end
   end
@@ -389,6 +562,12 @@ end
 mergeUserGraph = function()
   local graph = readGraph()
   userLocations = graph.locations
+  userLinks = {}
+  for _, link in ipairs(graph.links or {}) do
+    if type(link) == "table" and link.a and link.b and type(link.via) == "table" then
+      userLinks[#userLinks + 1] = link
+    end
+  end
   for _, g in ipairs(graph.gates) do
     if type(g) == "table" and g.id and g.from_level and g.box then
       g.user = true
@@ -407,6 +586,82 @@ mergeUserGraph = function()
     end
   end
   addUserRoads()
+  applyGateMoves(graph.moves)
+end
+
+local function groundStep(e0, n0, e1, n1, nx, ny)
+  local ex, ey = ny, -nx
+  local east_m = e1 - e0
+  local north_m = n1 - n0
+  if mapAuthority() == "EPSG:3857" then
+    local scale = webMercatorGroundScale((n0 + n1) * 0.5)
+    east_m = east_m * scale
+    north_m = north_m * scale
+  end
+  local dx = east_m * ex + north_m * nx
+  local dy = east_m * ey + north_m * ny
+  return dx, dy, math.sqrt(dx * dx + dy * dy)
+end
+
+-- Via points stored from the lexicographically first level toward the second.
+local function linkRecord(lo, hi)
+  for _, link in ipairs(userLinks) do
+    if type(link) == "table" and link.a == lo and link.b == hi and type(link.via) == "table" then
+      return link
+    end
+  end
+  return nil
+end
+
+local function reversePts(pts)
+  local rev = {}
+  for i = #pts, 1, -1 do
+    rev[#rev + 1] = pts[i]
+  end
+  return rev
+end
+
+local function copyMercator(pts)
+  local out = {}
+  for _, p in ipairs(pts or {}) do
+    if type(p) == "table" and tonumber(p[1]) and tonumber(p[2]) then
+      out[#out + 1] = { tonumber(p[1]), tonumber(p[2]) }
+    end
+  end
+  return out
+end
+
+-- Travel order follows the gate.
+local function linkViaOrdered(fromLevel, toLevel)
+  local lo, hi = fromLevel, toLevel
+  local flip = false
+  if lo > hi then
+    lo, hi = hi, lo
+    flip = true
+  end
+  local via
+  for _, link in ipairs(userLinks) do
+    if link.a == lo and link.b == hi and type(link.via) == "table" then
+      via = link.via
+      break
+    end
+  end
+  local pts = {}
+  if via then
+    for _, p in ipairs(via) do
+      if type(p) == "table" and tonumber(p[1]) and tonumber(p[2]) then
+        pts[#pts + 1] = { tonumber(p[1]), tonumber(p[2]) }
+      end
+    end
+  end
+  if flip then
+    local rev = {}
+    for i = #pts, 1, -1 do
+      rev[#rev + 1] = pts[i]
+    end
+    pts = rev
+  end
+  return pts
 end
 
 local function ensureUserArc(gate)
@@ -417,43 +672,98 @@ local function ensureUserArc(gate)
   local e1, n1 = centerOf(gate.from_level)
   local e2, n2 = centerOf(gate.to_level)
   local nx, ny = northOf(gate.from_level)
-  local dx, dy, length_m
+  local corners
+  local length_m
+  local crs = nil
   if e1 and e2 and nx then
     nx, ny = norm2(nx, ny)
-    local ex, ey = ny, -nx
-    local east_m = e2 - e1
-    local north_m = n2 - n1
-    dx = east_m * ex + north_m * nx
-    dy = east_m * ey + north_m * ny
-    length_m = math.sqrt(dx * dx + dy * dy)
-    if length_m < 50 then
-      dx, dy, length_m = nil, nil, nil
-    else
-      gate.center_distance_m = length_m
+    local _, _, straight_m = groundStep(e1, n1, e2, n2, nx, ny)
+    if straight_m >= 50 then
+      gate.center_distance_m = straight_m
+    end
+    if not crs or #crs < 2 then
+      crs = { { e1, n1 } }
+      for _, p in ipairs(linkViaOrdered(gate.from_level, gate.to_level)) do
+        crs[#crs + 1] = p
+      end
+      crs[#crs + 1] = { e2, n2 }
+    end
+    corners = { { pos[1], pos[2] } }
+    local x, y = pos[1], pos[2]
+    local pe, pn = crs[1][1], crs[1][2]
+    length_m = 0
+    for i = 2, #crs do
+      local dx, dy, seg = groundStep(pe, pn, crs[i][1], crs[i][2], nx, ny)
+      if seg >= 1 then
+        x = x + dx
+        y = y + dy
+        corners[#corners + 1] = { x, y }
+        length_m = length_m + seg
+      end
+      pe, pn = crs[i][1], crs[i][2]
+    end
+    if length_m < 50 or #corners < 2 then
+      corners = nil
+      length_m = nil
     end
   end
-  if not dx then
-    local t = gate.box.tangent or { 1, 0 }
-    dx, dy = norm2(t[1] or 1, t[2] or 0)
+  if not corners then
+    local tx, ty = norm2((gate.box.tangent or { 1, 0 })[1] or 1, (gate.box.tangent or { 1, 0 })[2] or 0)
     length_m = 800
-    dx, dy = dx * length_m, dy * length_m
-  end
-  local peak = math.min(250, math.max(40, length_m * 0.04))
-  local pts = {}
-  local samples = 24
-  for i = 0, samples do
-    local u = i / samples
-    pts[#pts + 1] = {
-      pos[1] + dx * u,
-      pos[2] + dy * u,
-      pos[3] + 4.5 + 4 * peak * u * (1 - u),
+    corners = {
+      { pos[1], pos[2] },
+      { pos[1] + tx * length_m, pos[2] + ty * length_m },
     }
   end
-  local inv = 1 / math.max(length_m, 1)
+  -- One hump over the drawn path. The crest is halfway along that line.
+  local peak = math.min(250, math.max(40, length_m * 0.04))
+  local pts = {}
+  local function emit(x, y, dist)
+    local u = dist / math.max(length_m, 1)
+    if u < 0 then
+      u = 0
+    elseif u > 1 then
+      u = 1
+    end
+    pts[#pts + 1] = { x, y, pos[3] + 4.5 + 4 * peak * u * (1 - u) }
+  end
+  emit(corners[1][1], corners[1][2], 0)
+  local travelled = 0
+  for i = 1, #corners - 1 do
+    local ax, ay = corners[i][1], corners[i][2]
+    local bx, by = corners[i + 1][1], corners[i + 1][2]
+    local sx, sy = bx - ax, by - ay
+    local seg = math.sqrt(sx * sx + sy * sy)
+    if seg >= 1 then
+      local pieces = math.floor(seg / math.max(400, length_m / 32))
+      if pieces < 1 then
+        pieces = 1
+      elseif pieces > 12 then
+        pieces = 12
+      end
+      for s = 1, pieces do
+        if #pts >= 96 then
+          break
+        end
+        local t = s / pieces
+        emit(ax + sx * t, ay + sy * t, travelled + seg * t)
+      end
+      travelled = travelled + seg
+    end
+  end
+  local endc = corners[#corners]
+  local last = pts[#pts]
+  if not last or (last[1] - endc[1]) ^ 2 + (last[2] - endc[2]) ^ 2 > 4 then
+    emit(endc[1], endc[2], length_m)
+  end
+  local dx, dy = endc[1] - pos[1], endc[2] - pos[2]
+  local chord = math.sqrt(dx * dx + dy * dy)
+  local inv = 1 / math.max(chord, 1)
   gate.arc = {
     points = pts,
     width_m = 15,
     length_m = length_m,
+    peak_m = peak,
     generated = true,
     heading = { dx * inv, dy * inv },
   }
@@ -472,18 +782,215 @@ local function drawUserPortals(level)
       local rx, ry = -fy, fx
       local hx, hy = (s[1] or 12) * 0.5, (s[2] or 8) * 0.5
       local z = c[3]
-      local function corner(sa, sb)
-        return vec3(c[1] + fx * hx * sa + rx * hy * sb, c[2] + fy * hx * sa + ry * hy * sb, z)
+      local hz = (s[3] or 6) * 0.5
+      local function corner(sa, sb, sz)
+        return vec3(c[1] + fx * hx * sa + rx * hy * sb, c[2] + fy * hx * sa + ry * hy * sb, z + hz * sz)
       end
-      local a, b, d, e = corner(1, 1), corner(1, -1), corner(-1, -1), corner(-1, 1)
+      local a, b, d, e = corner(1, 1, -1), corner(1, -1, -1), corner(-1, -1, -1), corner(-1, 1, -1)
+      local a2, b2, d2, e2 = corner(1, 1, 1), corner(1, -1, 1), corner(-1, -1, 1), corner(-1, 1, 1)
       pcall(function()
         debugDrawer:drawLine(a, b, col)
         debugDrawer:drawLine(b, d, col)
         debugDrawer:drawLine(d, e, col)
         debugDrawer:drawLine(e, a, col)
+        debugDrawer:drawLine(a2, b2, col)
+        debugDrawer:drawLine(b2, d2, col)
+        debugDrawer:drawLine(d2, e2, col)
+        debugDrawer:drawLine(e2, a2, col)
+        debugDrawer:drawLine(a, a2, col)
+        debugDrawer:drawLine(b, b2, col)
+        debugDrawer:drawLine(d, d2, col)
+        debugDrawer:drawLine(e, e2, col)
       end)
     end
   end
+end
+
+-- Same translucent cube as a built-in gate. Not written into the level file.
+local USER_BOX_SHAPE = "/art/shapes/portals/portal_cube.dae"
+local userBoxIds = {}
+local userBoxErr = nil
+
+local function userBoxName(gateId)
+  return "alpine_rt_ubox_" .. tostring(gateId)
+end
+
+local function deleteNamed(name, id)
+  local obj
+  if id and scenetree and scenetree.findObjectById then
+    obj = scenetree.findObjectById(id)
+  end
+  if not obj and name and scenetree and scenetree.findObject then
+    obj = scenetree.findObject(name)
+  end
+  if obj and obj.delete then
+    pcall(function()
+      obj:delete()
+    end)
+  end
+end
+
+local function orientUserBox(obj, gate)
+  local pos = gate.box.pos
+  local tangent = gate.box.tangent or { 1, 0 }
+  local size = gate.box.size or BOX_SIZE
+  local xx, xy = norm2(tangent[1] or 1, tangent[2] or 0)
+  local yx, yy = -xy, xx
+  local mat = MatrixF(true)
+  mat:setColumn(0, vec3(xx, xy, 0))
+  mat:setColumn(1, vec3(yx, yy, 0))
+  mat:setColumn(2, vec3(0, 0, 1))
+  mat:setColumn(3, vec3(pos[1], pos[2], pos[3]))
+  obj:setTransform(mat)
+  obj.scale = vec3(size[1] or BOX_SIZE[1], size[2] or BOX_SIZE[2], size[3] or BOX_SIZE[3])
+end
+
+local function userBoxShape(level)
+  local function exists(path)
+    return FS and FS.fileExists and FS:fileExists(path)
+  end
+  if level then
+    local path = "/levels/" .. level .. "/art/shapes/portals/portal_cube.dae"
+    if exists(path) then
+      return path
+    end
+    local lower = "/levels/" .. tostring(level):lower() .. "/art/shapes/portals/portal_cube.dae"
+    if lower ~= path and exists(lower) then
+      return lower
+    end
+  end
+  return USER_BOX_SHAPE
+end
+
+local function spawnUserBox(gate)
+  if not createObject or not gate or not gate.id or not gate.box or not gate.box.pos then
+    return false
+  end
+  local name = userBoxName(gate.id)
+  local shape = userBoxShape(gate.from_level)
+  local existing = scenetree and scenetree.findObject and scenetree.findObject(name)
+  if existing then
+    local have = ""
+    pcall(function()
+      have = tostring(existing:getField("shapeName", 0) or "")
+    end)
+    if have ~= shape then
+      deleteNamed(name, existing:getId())
+      existing = nil
+    end
+  end
+  if existing then
+    pcall(orientUserBox, existing, gate)
+    existing.hidden = false
+    existing.isRenderEnabled = true
+    existing.useInstanceRenderData = false
+    userBoxIds[name] = existing:getId()
+    return true
+  end
+  local obj = createObject("TSStatic")
+  if not obj then
+    log("E", "alpine_rt", "user box create failed")
+    return false
+  end
+  obj.canSave = false
+  obj:setField("shapeName", 0, shape)
+  obj.shapeName = shape
+  obj:setField("collisionType", 0, "None")
+  obj:setField("decalType", 0, "None")
+  obj:setField("castShadows", 0, "0")
+  obj:setField("useInstanceRenderData", 0, "0")
+  obj.useInstanceRenderData = false
+  obj.hidden = false
+  obj.isRenderEnabled = true
+  local pos = gate.box.pos
+  obj:setPosition(vec3(pos[1], pos[2], pos[3]))
+  local size = gate.box.size or BOX_SIZE
+  obj.scale = vec3(size[1] or BOX_SIZE[1], size[2] or BOX_SIZE[2], size[3] or BOX_SIZE[3])
+  obj:registerObject(name)
+  local grp = scenetree.findObject and (
+    scenetree.findObject("alpine_rt_portals") or scenetree.findObject("MissionGroup")
+  )
+  if grp and grp.addObject then
+    pcall(function()
+      grp:addObject(obj)
+    end)
+  end
+  pcall(orientUserBox, obj, gate)
+  obj.canSave = false
+  userBoxIds[name] = obj:getId()
+  log("I", "alpine_rt", "user box " .. name .. " " .. shape)
+  return true
+end
+
+local arcHomePos = {}
+
+local function placeMovedBoxes(level)
+  if not level or not scenetree or not scenetree.findObject then
+    return
+  end
+  for _, g in ipairs(portals.gates or {}) do
+    if g.moved and canonicalLevel(g.from_level) == level and g.box and g.box.pos then
+      local obj = scenetree.findObject("alpine_rt_box_" .. tostring(g.id))
+      if obj then
+        pcall(orientUserBox, obj, g)
+      end
+      local delta = g.moveDelta
+      local arc = delta and scenetree.findObject("alpine_rt_arc_" .. tostring(g.id))
+      if arc and arc.getPosition and arc.setPosition then
+        local home = arcHomePos[g.id]
+        if not home then
+          local p = arc:getPosition()
+          home = { p.x, p.y, p.z }
+          arcHomePos[g.id] = home
+        end
+        arc:setPosition(vec3(home[1] + delta[1], home[2] + delta[2], home[3] + delta[3]))
+      end
+    end
+  end
+end
+
+local function syncUserBoxes(level)
+  if not level then
+    return
+  end
+  local keep = {}
+  for _, g in ipairs(portals.gates or {}) do
+    if g.user and g.from_level == level and g.box and g.box.pos then
+      local name = userBoxName(g.id)
+      if spawnUserBox(g) then
+        keep[name] = true
+      end
+    end
+  end
+  for name, id in pairs(userBoxIds) do
+    if not keep[name] then
+      deleteNamed(name, id)
+      userBoxIds[name] = nil
+    end
+  end
+end
+
+local function userGateMarkCrs(gate)
+  local loc = userLocations[gate.from_level]
+  local pos = gate.box and gate.box.pos
+  if not loc or not pos or type(loc.anchor_beamng) ~= "table" or type(loc.crs) ~= "table" or type(loc.north) ~= "table" then
+    return nil
+  end
+  if not loc.anchor_beamng[1] or not loc.crs[1] or not loc.north[1] then
+    return nil
+  end
+  local nx, ny = norm2(loc.north[1], loc.north[2] or 0)
+  local ex, ey = ny, -nx
+  local dx = pos[1] - loc.anchor_beamng[1]
+  local dy = pos[2] - loc.anchor_beamng[2]
+  local east_m = dx * ex + dy * ey
+  local north_m = dx * nx + dy * ny
+  if loc.authority == "EPSG:3857" then
+    local scale = webMercatorGroundScale(loc.crs[2])
+    east_m = east_m / scale
+    north_m = north_m / scale
+  end
+  return { loc.crs[1] + east_m, loc.crs[2] + north_m }
 end
 
 local function findUserGate(fromLevel, toLevel)
@@ -510,10 +1017,14 @@ local function openReturns(level)
         end
       end
       if not back then
+        local label = g.label
+        if type(label) ~= "string" or label == "" or label:find("levels%.", 1, true) then
+          label = levelTitle(g.from_level)
+        end
         out[#out + 1] = {
           id = g.id,
           from_level = g.from_level,
-          label = g.label or g.from_level,
+          label = label,
         }
       end
     end
@@ -591,6 +1102,15 @@ local function defineLocation(name, lat, lon, cardinal)
   return { ok = true, authority = authority, east = e, north = n }
 end
 
+local function holdFreshPortal(gate)
+  freshPortal.id = gate and gate.id or nil
+  freshPortal.untilT = now() + 10
+  dwellGate = nil
+  dwellAcc = 0
+  dwellNeed = 0
+  uiMsg("Suppressing new portal for 10s, please move if you don't want to visit " .. destName(gate), 10)
+end
+
 local function placePortal(toLevel)
   toLevel = tostring(toLevel or "")
   local level = currentLevel()
@@ -628,7 +1148,9 @@ local function placePortal(toLevel)
   end
   writeGraph(graph)
   reloadPortals()
+  pcall(syncUserBoxes, level)
   uiMsg("Portal to " .. levelTitle(toLevel), 4)
+  holdFreshPortal(gate)
   return { ok = true, id = gate.id }
 end
 
@@ -674,7 +1196,9 @@ local function placeReturn(gateId)
   graph.gates[#graph.gates + 1] = back
   writeGraph(graph)
   reloadPortals()
+  pcall(syncUserBoxes, level)
   uiMsg("Return portal to " .. levelTitle(inbound.from_level), 4)
+  holdFreshPortal(back)
   return { ok = true, id = back.id }
 end
 
@@ -682,10 +1206,14 @@ local function listLevels()
   local out = {}
   local seen = {}
   local function add(id, title)
+    id = canonicalLevel(id)
     if type(id) ~= "string" or id == "" or seen[id] or id == currentLevel() then
       return
     end
     seen[id] = true
+    if type(title) ~= "string" or title == "" or title:find("^levels%.", 1) or title:find("{{", 1, true) then
+      title = nil
+    end
     out[#out + 1] = { id = id, title = title or levelTitle(id) }
   end
   local raw
@@ -737,6 +1265,512 @@ local function listLevels()
   return out
 end
 
+local PROVIDERS = {
+  geoland = true,
+  ["geoland-aerial"] = true,
+  ["geoland-terrain"] = true,
+  osm = true,
+}
+
+local function regionName(name)
+  name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  name = name:gsub("[^%w_%- ]", "")
+  name = name:gsub("%s+", "_")
+  if #name > 48 then
+    name = name:sub(1, 48)
+  end
+  return name
+end
+
+local function regionPath(name)
+  return REGION_DIR .. "/" .. name .. ".json"
+end
+
+local function regionDocument(graph)
+  local view = graph.view or {}
+  return {
+    format = "alpine_rt_region",
+    version = 1,
+    authority = mapAuthority(),
+    view = {
+      provider = type(view.provider) == "string" and view.provider or "geoland",
+      redraw = tonumber(view.redraw) or 0,
+    },
+    locations = graph.locations,
+    gates = graph.gates,
+    links = graph.links or {},
+    moves = graph.moves or {},
+  }
+end
+
+local function regionCatalog(graph)
+  local locs = {}
+  for id, loc in pairs(graph.locations or {}) do
+    if type(loc) == "table" then
+      local w = loc.wgs84
+      locs[#locs + 1] = {
+        id = tostring(id),
+        name = loc.name or tostring(id),
+        lat = type(w) == "table" and w[1] or nil,
+        lon = type(w) == "table" and w[2] or nil,
+      }
+    end
+  end
+  table.sort(locs, function(a, b)
+    return tostring(a.name):lower() < tostring(b.name):lower()
+  end)
+  local gates = {}
+  local seen = {}
+  local here = currentLevel()
+  local function addGate(g)
+    if type(g) ~= "table" or not g.id or seen[g.id] then
+      return
+    end
+    seen[g.id] = true
+    gates[#gates + 1] = {
+      id = g.id,
+      from_level = g.from_level,
+      to_level = g.to_level,
+      label = (type(g.label) == "string" and g.label ~= "" and not g.label:find("levels%.", 1, true)) and g.label or ("To " .. levelTitle(g.to_level)),
+      linked = type(g.arrive) == "table",
+      builtin = g.user ~= true,
+      here = canonicalLevel(g.from_level) == here,
+    }
+  end
+  for _, g in ipairs(portals.gates or {}) do
+    if canonicalLevel(g.from_level) == here then
+      addGate(g)
+    end
+  end
+  for _, g in ipairs(graph.gates or {}) do
+    addGate(g)
+  end
+  return { locations = locs, gates = gates }
+end
+
+local function regionView(graph)
+  local view = graph.view or {}
+  local provider = view.provider
+  if type(provider) ~= "string" or not PROVIDERS[provider] then
+    provider = "geoland"
+  end
+  return { provider = provider, redraw = tonumber(view.redraw) or 0 }
+end
+
+local function saveRegion(name)
+  name = regionName(name)
+  if name == "" then
+    return fail("Region name is required.")
+  end
+  if FS and FS.directoryCreate and FS.directoryExists and not FS:directoryExists(REGION_DIR) then
+    FS:directoryCreate(REGION_DIR, true)
+  end
+  local path = regionPath(name)
+  if not jsonWriteFile(path, regionDocument(readGraph()), true) then
+    return fail("Could not write the region file.")
+  end
+  log("I", "alpine_rt", "saved region " .. name)
+  return { ok = true, name = name, path = path }
+end
+
+local function listRegions()
+  local out = {}
+  if not (FS and FS.findFiles) then
+    return out
+  end
+  local ok, files = pcall(function()
+    return FS:findFiles(REGION_DIR .. "/", "*.json", 0, true, false)
+  end)
+  if not ok or type(files) ~= "table" then
+    return out
+  end
+  local seen = {}
+  for _, path in ipairs(files) do
+    if type(path) == "string" then
+      local name = path:match("([^/\\]+)%.json$")
+      if name and name ~= "" and not seen[name] then
+        seen[name] = true
+        out[#out + 1] = { name = name }
+      end
+    end
+  end
+  table.sort(out, function(a, b)
+    return a.name:lower() < b.name:lower()
+  end)
+  return out
+end
+
+local function loadRegion(name)
+  name = regionName(name)
+  if name == "" then
+    return fail("Region name is required.")
+  end
+  local data = jsonReadFile(regionPath(name))
+  if type(data) ~= "table" or data.format ~= "alpine_rt_region" then
+    return fail("Not a region file.")
+  end
+  if data.authority and mapAuthority() and data.authority ~= mapAuthority() then
+    return fail("This file is " .. tostring(data.authority) .. ". The overview is " .. mapAuthority() .. ".")
+  end
+  if type(data.locations) ~= "table" or type(data.gates) ~= "table" then
+    return fail("Region file is missing locations or gates.")
+  end
+  local view = type(data.view) == "table" and data.view or {}
+  writeGraph({
+    locations = data.locations,
+    gates = data.gates,
+    view = view,
+    links = type(data.links) == "table" and data.links or {},
+    moves = type(data.moves) == "table" and data.moves or {},
+  })
+  reloadPortals()
+  uiMsg("Region loaded: " .. name, 4)
+  log("I", "alpine_rt", "loaded region " .. name)
+  return { ok = true, name = name, gates = #data.gates }
+end
+
+local function setRegionProvider(id)
+  id = tostring(id or "")
+  if not PROVIDERS[id] then
+    return fail("Unknown map provider.")
+  end
+  local graph = readGraph()
+  graph.view.provider = id
+  graph.view.redraw = (tonumber(graph.view.redraw) or 0) + 1
+  writeGraph(graph)
+  return { ok = true, provider = id, redraw = graph.view.redraw }
+end
+
+local function setUserLink(levelA, levelB, via)
+  levelA = tostring(levelA or "")
+  levelB = tostring(levelB or "")
+  if levelA == "" or levelB == "" or levelA == levelB then
+    return fail("Two maps are required.")
+  end
+  local clean = {}
+  if type(via) == "table" then
+    for _, p in ipairs(via) do
+      if type(p) == "table" then
+        local e, n = tonumber(p[1]), tonumber(p[2])
+        if e and n then
+          clean[#clean + 1] = { e, n }
+          if #clean >= 24 then
+            break
+          end
+        end
+      end
+    end
+  end
+  if levelA > levelB then
+    levelA, levelB = levelB, levelA
+    local rev = {}
+    for i = #clean, 1, -1 do
+      rev[#rev + 1] = clean[i]
+    end
+    clean = rev
+  end
+  local graph = readGraph()
+  local kept = {}
+  for _, link in ipairs(graph.links) do
+    if type(link) ~= "table" or link.a ~= levelA or link.b ~= levelB then
+      kept[#kept + 1] = link
+    end
+  end
+  kept[#kept + 1] = { a = levelA, b = levelB, via = clean }
+  graph.links = kept
+  writeGraph(graph)
+  reloadPortals()
+  return { ok = true, points = #clean }
+end
+
+local function redrawRegion()
+  local graph = readGraph()
+  graph.view.redraw = (tonumber(graph.view.redraw) or 0) + 1
+  writeGraph(graph)
+  return { ok = true, redraw = graph.view.redraw }
+end
+
+-- CEF cancels https images inside the HUD (OnBeforeResourceLoad). The game
+-- client downloads the tiles; the app then draws those local files.
+local TILE_ROOT = "/ui/modules/apps/alpineRtTrafficMap/tilecache"
+local TILE_SOURCES = {
+  geoland = {
+    url = "https://mapsneu.wien.gv.at/basemap/geolandbasemap/normal/google3857/{z}/{y}/{x}.png",
+    ext = "png",
+  },
+  ["geoland-aerial"] = {
+    url = "https://mapsneu.wien.gv.at/basemap/bmaporthofoto30cm/normal/google3857/{z}/{y}/{x}.jpeg",
+    ext = "jpeg",
+  },
+  ["geoland-terrain"] = {
+    url = "https://mapsneu.wien.gv.at/basemap/bmapgelaende/grau/google3857/{z}/{y}/{x}.jpeg",
+    ext = "jpeg",
+  },
+  osm = {
+    url = "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    ext = "png",
+  },
+}
+local tileJob = { id = 0 }
+local tileHttp = {}
+local tileHttpSeq = 0
+
+-- core_online.download stores a full https URL as "url" only. This game's
+-- client rejects that table unless "uri" is set, and then never calls back.
+local function onTileDownload(id, responseCode)
+  local done = tileHttp[id]
+  tileHttp[id] = nil
+  if done then
+    done(tonumber(responseCode) or 0)
+  end
+end
+
+local function downloadTile(url, path, done)
+  if not (SecureComm and SecureComm.apiCall) then
+    done(0)
+    return
+  end
+  tileHttpSeq = tileHttpSeq + 1
+  local id = tileHttpSeq
+  tileHttp[id] = done
+  local ok, err = pcall(SecureComm.apiCall, {
+    id = id,
+    uri = url,
+    url = url,
+    outfile = path,
+    reqType = "get",
+    isJson = false,
+    postDataString = "",
+    postFileName = "",
+    callback_finish_c = "extensions.alpinert.onTileDownload",
+  })
+  if not ok then
+    tileHttp[id] = nil
+    log("E", "alpine_rt", "tile http " .. tostring(err))
+    done(0)
+  end
+end
+
+local function tileUrl(template, z, x, y)
+  return (template:gsub("{z}", tostring(z)):gsub("{x}", tostring(x)):gsub("{y}", tostring(y)))
+end
+
+local function tilePath(provider, z, x, y, ext)
+  return string.format("%s/%s/%d/%d/%d.%s", TILE_ROOT, provider, z, x, y, ext)
+end
+
+local function tileFileReady(path)
+  if not (FS and FS.fileExists and FS:fileExists(path)) then
+    return false
+  end
+  local size = (FS.fileSize and FS:fileSize(path)) or 0
+  if size < 32 then
+    if FS.removeFile then
+      FS:removeFile(path)
+    end
+    return false
+  end
+  return true
+end
+
+local function fetchRegionTiles(provider, z, x0, y0, x1, y1)
+  provider = tostring(provider or "")
+  local spec = TILE_SOURCES[provider]
+  if not spec or not PROVIDERS[provider] then
+    return fail("Unknown map provider.")
+  end
+  z = math.floor(tonumber(z) or -1)
+  x0 = math.floor(tonumber(x0) or 0)
+  y0 = math.floor(tonumber(y0) or 0)
+  x1 = math.floor(tonumber(x1) or -1)
+  y1 = math.floor(tonumber(y1) or -1)
+  local count = (x1 - x0 + 1) * (y1 - y0 + 1)
+  if z < 0 or z > 18 or x1 < x0 or y1 < y0 or count < 1 or count > 48 then
+    return fail("Tile window is out of range.")
+  end
+  if not (SecureComm and SecureComm.apiCall) then
+    return fail("Map download is unavailable.")
+  end
+  if settings and settings.getValue and settings.getValue("onlineFeatures") ~= "enable" then
+    return fail("Online features are disabled in the BeamNG settings.")
+  end
+
+  local id = (tonumber(tileJob.id) or 0) + 1
+  local job = { id = id, pending = 0, closed = false, ready = false, failed = 0, files = {} }
+  tileJob = job
+
+  local function settle(x, y, path, ok)
+    if tileJob ~= job then
+      return
+    end
+    job.files[#job.files + 1] = { x = x, y = y, path = path, ok = ok == true }
+    if not ok then
+      job.failed = job.failed + 1
+    end
+    job.pending = job.pending - 1
+    if job.closed and job.pending <= 0 then
+      job.ready = true
+      log("I", "alpine_rt", string.format("tiles %s z=%d failed=%d", provider, z, job.failed))
+    end
+  end
+
+  for y = y0, y1 do
+    for x = x0, x1 do
+      local path = tilePath(provider, z, x, y, spec.ext)
+      job.pending = job.pending + 1
+      if tileFileReady(path) then
+        settle(x, y, path, true)
+      else
+        local parent = path:match("^(.*)/[^/]+$")
+        if parent and FS and FS.directoryCreate and not (FS.directoryExists and FS:directoryExists(parent)) then
+          FS:directoryCreate(parent, true)
+        end
+        local url = tileUrl(spec.url, z, x, y)
+        downloadTile(url, path, function(code)
+          settle(x, y, path, code == 200 and tileFileReady(path))
+        end)
+      end
+    end
+  end
+  job.closed = true
+  if job.pending <= 0 then
+    job.ready = true
+  end
+  return { ok = true, id = id, pending = job.pending, error = job.error }
+end
+
+local function regionTiles(id)
+  id = tonumber(id)
+  if not id or tileJob.id ~= id then
+    return { ready = false, id = id }
+  end
+  if not tileJob.ready then
+    return { ready = false, id = id, pending = tileJob.pending }
+  end
+  return {
+    ready = true,
+    id = id,
+    failed = tileJob.failed or 0,
+    files = tileJob.files,
+    error = tileJob.error,
+  }
+end
+
+local function moveUserGate(id)
+  id = tostring(id or "")
+  local level = currentLevel()
+  if not level then
+    return fail("No level is loaded.")
+  end
+  local pos, tangent = vehiclePose()
+  if not pos then
+    return fail("No vehicle.")
+  end
+  local graph = readGraph()
+  local gate
+  for _, g in ipairs(graph.gates) do
+    if type(g) == "table" and g.id == id then
+      gate = g
+      break
+    end
+  end
+  if gate then
+    if canonicalLevel(gate.from_level) ~= level then
+      return fail("This portal belongs to another map.")
+    end
+    gate.box = { pos = pos, tangent = tangent, size = { BOX_SIZE[1], BOX_SIZE[2], BOX_SIZE[3] } }
+    local dest = canonicalLevel(gate.to_level)
+    for _, other in ipairs(graph.gates) do
+      if type(other) == "table" and other ~= gate
+        and canonicalLevel(other.from_level) == dest
+        and canonicalLevel(other.to_level) == level then
+        other.arrive = { pos = ahead(pos, tangent, ARRIVE_AHEAD_M), tangent = tangent }
+        break
+      end
+    end
+    writeGraph(graph)
+    reloadPortals()
+    pcall(syncUserBoxes, level)
+    uiMsg("Portal moved", 3)
+    return { ok = true, id = gate.id }
+  end
+  local shipped
+  for _, g in ipairs(portals.gates or {}) do
+    if g.id == id and not g.user then
+      shipped = g
+      break
+    end
+  end
+  if not shipped or not shipped.from_level then
+    return fail("Portal not found.")
+  end
+  if canonicalLevel(shipped.from_level) ~= level then
+    return fail("This portal belongs to another map.")
+  end
+  local rec = type(graph.moves[id]) == "table" and graph.moves[id] or {}
+  rec.pos = pos
+  rec.tangent = tangent
+  graph.moves[id] = rec
+  local dest = canonicalLevel(shipped.to_level)
+  for _, other in ipairs(portals.gates) do
+    if not other.user and other.id ~= id
+      and canonicalLevel(other.from_level) == dest
+      and canonicalLevel(other.to_level) == level then
+      local back = type(graph.moves[other.id]) == "table" and graph.moves[other.id] or {}
+      back.arrive = { pos = ahead(pos, tangent, ARRIVE_AHEAD_M), tangent = tangent }
+      graph.moves[other.id] = back
+      break
+    end
+  end
+  writeGraph(graph)
+  reloadPortals()
+  pcall(placeMovedBoxes, level)
+  uiMsg("Portal moved", 3)
+  return { ok = true, id = id }
+end
+
+local function removeUserGate(id)
+  id = tostring(id or "")
+  local graph = readGraph()
+  local kept = {}
+  local found = false
+  for _, g in ipairs(graph.gates) do
+    if type(g) == "table" and g.id == id then
+      found = true
+    else
+      kept[#kept + 1] = g
+    end
+  end
+  if not found then
+    return fail("Portal not found.")
+  end
+  graph.gates = kept
+  writeGraph(graph)
+  reloadPortals()
+  uiMsg("Portal removed", 3)
+  return { ok = true }
+end
+
+local function removeLocation(levelId)
+  levelId = tostring(levelId or "")
+  local graph = readGraph()
+  if type(graph.locations[levelId]) ~= "table" then
+    return fail("Location not found.")
+  end
+  graph.locations[levelId] = nil
+  local kept = {}
+  for _, g in ipairs(graph.gates) do
+    if type(g) ~= "table" or (g.from_level ~= levelId and g.to_level ~= levelId) then
+      kept[#kept + 1] = g
+    end
+  end
+  graph.gates = kept
+  writeGraph(graph)
+  reloadPortals()
+  uiMsg("Location removed: " .. levelId, 3)
+  return { ok = true }
+end
+
 local function envTime(env)
   if type(env) ~= "table" then
     return nil
@@ -750,27 +1784,36 @@ local function envTime(env)
   return nil
 end
 
--- Sun clock only. Do not push fog/clouds via setState: jbWeather's onClientStartMission
--- resets to clear, and core_environment.setState retriggers the map default sky.
+-- Clock slice. 0.40 setTimeOfDay accepts time, play, and dayLength.
+-- dayScale and nightScale are gone. Do not push fog or clouds: setState retriggers the map sky.
 local function applyClock(env)
-  if not (core_environment and core_environment.getTimeOfDay and core_environment.setTimeOfDay) then
+  if not (core_environment and core_environment.setTimeOfDay) then
     return
   end
-  local tod = core_environment.getTimeOfDay() or {}
+  if type(env) ~= "table" then
+    return
+  end
+  local clock = {}
   local t = envTime(env)
-  if t == nil and core_environment.getState then
-    t = envTime(core_environment.getState())
-  end
   if t ~= nil then
-    tod.time = t
+    clock.time = t
   end
-  tod.play = true
-  tod.dayLength = DAY_LENGTH_S
-  tod.dayScale = 1
-  tod.nightScale = 1
+  if env.play ~= nil then
+    clock.play = env.play == true
+  end
+  local dayLength = tonumber(env.dayLength)
+  if dayLength and dayLength > 0 then
+    clock.dayLength = dayLength
+  end
+  if clock.time == nil and clock.play == nil and clock.dayLength == nil then
+    return
+  end
   pcall(function()
-    core_environment.setTimeOfDay(tod)
+    core_environment.setTimeOfDay(clock)
   end)
+  log("I", "alpine_rt", "clock restore time=" .. tostring(clock.time)
+    .. " play=" .. tostring(clock.play)
+    .. " dayLength=" .. tostring(clock.dayLength))
 end
 
 local function ensureJbWeather()
@@ -1004,12 +2047,14 @@ local function drawGateArc(gate)
   local colDim = ColorF(1.0, 0.35, 0.22, 0.35)
   local w = tonumber(arc.width_m) or 15
   local hw = w * 0.5
+  local shift = gate.moveDelta or { 0, 0, 0 }
+  local sx, sy, sz = shift[1] or 0, shift[2] or 0, shift[3] or 0
   for i = 1, #arc.points - 1 do
     local a = arc.points[i]
     local b = arc.points[i + 1]
     if a and b then
-      local ax, ay, az = a[1], a[2], a[3]
-      local bx, by, bz = b[1], b[2], b[3]
+      local ax, ay, az = a[1] + sx, a[2] + sy, a[3] + sz
+      local bx, by, bz = b[1] + sx, b[2] + sy, b[3] + sz
       pcall(function()
         debugDrawer:drawLine(vec3(ax, ay, az), vec3(bx, by, bz), col)
       end)
@@ -1086,7 +2131,8 @@ local function ensureLiveArc(gate)
   obj:setField("collisionType", 0, "None")
   obj:setField("decalType", 0, "None")
   obj:setField("castShadows", 0, "0")
-  obj:setPosition(vec3(pts[1][1], pts[1][2], pts[1][3]))
+  local shift = gate.moveDelta or { 0, 0, 0 }
+  obj:setPosition(vec3(pts[1][1] + (shift[1] or 0), pts[1][2] + (shift[2] or 0), pts[1][3] + (shift[3] or 0)))
   obj.scale = vec3(1, 1, 1)
   obj.hidden = false
   obj.isRenderEnabled = true
@@ -1105,6 +2151,9 @@ local function ensureLiveArc(gate)
   return true
 end
 
+local readTodFraction
+local gameClock
+do
 -- BeamNG TimeOfDay.time: 0=noon, 0.25=sunset, 0.5=midnight, 0.75=sunrise.
 local function todToHour(t)
   t = tonumber(t)
@@ -1114,7 +2163,7 @@ local function todToHour(t)
   return (t * 24 + 12) % 24
 end
 
-local function readTodFraction()
+readTodFraction = function()
   if core_environment and core_environment.getTimeOfDay then
     local tod = core_environment.getTimeOfDay()
     if type(tod) == "table" and type(tod.time) == "number" then
@@ -1294,7 +2343,7 @@ local function diurnalFactor(hour)
   return 0.70
 end
 
-local function gameClock(session)
+gameClock = function(session)
   session = session or {}
   session.world = session.world or {}
   local w = session.world
@@ -1327,6 +2376,132 @@ local function gameClock(session)
     diurnal = dia,
   }
 end
+end
+
+local function waterStagesPath(level)
+  return "/levels/" .. tostring(level) .. "/water_stages.json"
+end
+
+local function pickWaterStageName(data, month)
+  local stages = (data and data.stages) or {}
+  month = tonumber(month)
+  if month then
+    for name, spec in pairs(stages) do
+      local months = spec and spec.months
+      if type(months) == "table" then
+        for _, m in ipairs(months) do
+          if tonumber(m) == month then
+            return name
+          end
+        end
+      end
+    end
+  end
+  return (data and data.stage) or "spring"
+end
+
+-- One decoded copy per loaded level. false means the file is absent, so a miss
+-- is not probed again. Dropped on mission end.
+local function cachedWaterStages(level)
+  if waterFileLevel == level then
+    return waterFileData
+  end
+  local data = jsonReadFile(waterStagesPath(level))
+  if type(data) ~= "table" then
+    data = false
+  end
+  waterFileLevel = level
+  waterFileData = data
+  return data
+end
+
+local function applyWaterStage(name)
+  local level = currentLevel()
+  if not level then
+    return false
+  end
+  local data = cachedWaterStages(level)
+  if type(data) ~= "table" or type(data.objects) ~= "table" then
+    return false
+  end
+  if name == nil then
+    local clock = gameClock(readSession())
+    name = pickWaterStageName(data, clock.month)
+    waterStageMonth = clock.month
+  end
+  local st = (data.stages or {})[name]
+  if type(st) ~= "table" then
+    log("W", "alpine_rt", "water stage missing: " .. tostring(name))
+    return false
+  end
+  local dz = tonumber(st.surface_dz_m) or 0
+  local ws = tonumber(st.width_scale) or 1
+  local ds = tonumber(st.depth_scale) or 1
+  local flow = tonumber(st.flow_mps)
+  local n = 0
+  for _, o in ipairs(data.objects) do
+    local obj = scenetree.findObject and scenetree.findObject(o.name)
+    if obj and o.class == "River" and type(o.base_nodes) == "table" then
+      for i, node in ipairs(o.base_nodes) do
+        local idx = i - 1
+        pcall(function()
+          obj:setNodePosition(idx, vec3(node[1], node[2], node[3] + dz))
+          obj:setNodeWidth(idx, math.max(0.25, (tonumber(node[4]) or 4) * ws))
+          obj:setNodeDepth(idx, math.max(0.25, (tonumber(node[5]) or 1.2) * ds))
+        end)
+      end
+      if flow then
+        pcall(function()
+          obj:setField("FlowMagnitudePhysics", 0, tostring(flow))
+        end)
+      end
+      pcall(function()
+        if obj.regenerate then
+          obj:regenerate()
+        end
+      end)
+      n = n + 1
+    elseif obj and o.class == "WaterBlock" and o.base_z then
+      pcall(function()
+        local p = obj:getPosition()
+        obj:setPosition(vec3(p.x, p.y, o.base_z + dz))
+      end)
+      n = n + 1
+    end
+  end
+  waterStageFor = level .. ":" .. tostring(name)
+  waterStageLevel = level
+  log("I", "alpine_rt", "water stage " .. tostring(name) .. " objects=" .. tostring(n))
+  return n > 0
+end
+
+local function ensureWaterStage()
+  local level = currentLevel()
+  if not level then
+    return
+  end
+  if waterStageLevel == level and waterStageFor then
+    return
+  end
+  local data = cachedWaterStages(level)
+  if data == false or type(data) ~= "table" then
+    waterStageFor = level .. ":none"
+    waterStageLevel = level
+    return
+  end
+  local clock = gameClock(readSession())
+  local name = pickWaterStageName(data, clock.month)
+  waterStageMonth = clock.month
+  local tag = level .. ":" .. tostring(name)
+  if waterStageFor == tag then
+    waterStageLevel = level
+    return
+  end
+  if not applyWaterStage(name) then
+    waterStageFor = tag
+    waterStageLevel = level
+  end
+end
 
 local function hash01(text, seed, extra)
   local h = 0
@@ -1346,12 +2521,36 @@ local function playTimeSeed(session)
   return os.time()
 end
 
+local function liveDayLength()
+  if not (core_environment and core_environment.getTimeOfDay) then
+    return nil
+  end
+  local tod = core_environment.getTimeOfDay()
+  local n = tod and tonumber(tod.dayLength)
+  if n and n > 0 then
+    return n
+  end
+  return nil
+end
+
 local function stampWorld(session)
   session = session or {}
   session.world = session.world or {}
   local w = session.world
-  w.clock_rate = 24
-  w.day_length_s = DAY_LENGTH_S
+  local dayLength = liveDayLength()
+  if dayLength then
+    w.day_length_s = dayLength
+    local rate = 86400 / dayLength
+    local whole = math.floor(rate + 0.5)
+    if math.abs(rate - whole) < 0.05 then
+      w.clock_rate = whole
+    else
+      w.clock_rate = math.floor(rate * 1000 + 0.5) / 1000
+    end
+  elseif w.day_length_s == nil then
+    w.day_length_s = DAY_LENGTH_S
+    w.clock_rate = 24
+  end
   if not w.calendar_start then
     local started = tostring(session.started_at or "")
     w.calendar_start = started:match("^(%d%d%d%d%-%d%d%-%d%d)") or os.date("!%Y-%m-%d")
@@ -1375,6 +2574,11 @@ local function tickGameCalendar(session)
   w.last_tod = tod
   if wrap then
     writeSession(session)
+    local clock = gameClock(session)
+    if waterStageMonth and clock.month ~= waterStageMonth then
+      waterStageFor = nil
+      log("I", "alpine_rt", "water month " .. tostring(waterStageMonth) .. " -> " .. tostring(clock.month))
+    end
     log("I", "alpine_rt", string.format("game day -> %s (tod wrap)", tostring(w.game_day)))
   end
   return session
@@ -1437,7 +2641,88 @@ local function segDensity(segId, tSec, seed)
   return v
 end
 
-local function gateById(id)
+local gateById
+
+local function pointOf(p)
+  if type(p) ~= "table" then
+    return nil
+  end
+  local e, n = tonumber(p[1]), tonumber(p[2])
+  if not e or not n then
+    return nil
+  end
+  return { e, n }
+end
+
+local function authoredVia(road, aIsLo)
+  local spec = road.via_wgs84
+  local pts = {}
+  if type(spec) == "table" and type(spec.points) == "table" then
+    for _, p in ipairs(spec.points) do
+      if type(p) == "table" then
+        local lat, lon = tonumber(p[1]), tonumber(p[2])
+        if lat and lon then
+          local e, n = wgs84ToWebMercator(lat, lon)
+          if e and n then
+            pts[#pts + 1] = { e, n }
+          end
+        end
+      end
+    end
+    if spec.along and road.a and tostring(spec.along) ~= tostring(road.a) then
+      pts = reversePts(pts)
+    end
+  end
+  if not aIsLo then
+    pts = reversePts(pts)
+  end
+  return pts
+end
+
+-- Control polyline for a shipped road, ordered from the lexicographic first level to the second.
+-- A saved link replaces the authored bends. Endpoints stay the portal marks.
+local function builtInEditRoute(road)
+  if road.user or not road.a or not road.b then
+    return nil
+  end
+  local ga = gateById(road.a)
+  local gb = gateById(road.b)
+  local route = road.route_crs
+  if not ga or not gb or not ga.from_level or not gb.from_level then
+    return nil
+  end
+  if type(route) ~= "table" or #route < 2 then
+    return nil
+  end
+  local startPt = pointOf(route[1])
+  local endPt = pointOf(route[#route])
+  if not startPt or not endPt then
+    return nil
+  end
+  local lo, hi = ga.from_level, gb.from_level
+  local aIsLo = true
+  if lo > hi then
+    lo, hi = hi, lo
+    aIsLo = false
+  end
+  local loMark = aIsLo and startPt or endPt
+  local hiMark = aIsLo and endPt or startPt
+  local via
+  local link = linkRecord(lo, hi)
+  if link then
+    via = copyMercator(link.via)
+  else
+    via = authoredVia(road, aIsLo)
+  end
+  local out = { loMark }
+  for _, p in ipairs(via) do
+    out[#out + 1] = p
+  end
+  out[#out + 1] = hiMark
+  return out, { lo, hi }
+end
+
+gateById = function(id)
   if not id then
     return nil
   end
@@ -1530,6 +2815,9 @@ local function rollDwellNeed(gate, clock, seed)
   local base = dwellBaseS(gate)
   local dest = gate and gate.to_level
   local cls = classifyTraffic(mapDensity(dest, clock, seed))
+  if gate and gate.discoverable then
+    cls = "clear"
+  end
   local u = math.random()
   local need
   if cls == "clear" then
@@ -1688,19 +2976,57 @@ local function getTrafficMap()
   for _, r in ipairs(portals.roads or {}) do
     local a = gateById(r.a)
     local b = gateById(r.b)
+    local hiddenRoad = r.discoverable == true or (a and a.discoverable) or (b and b.discoverable)
+    if hiddenRoad then
+      -- side portals have no overview route
+    else
     local mark = r.map_mark
     if type(mark) == "table" and type(mark.crs) == "table" and #mark.crs >= 2 then
       local da = a and mapDensity(a.to_level, clock, seed) or nil
       local db = b and mapDensity(b.to_level, clock, seed) or nil
+      local route = type(r.route_crs) == "table" and r.route_crs[1] and r.route_crs or nil
+      local ends = r.ends
+      local editable = r.user == true
+      if not r.user then
+        local built, pair = builtInEditRoute(r)
+        if built and pair then
+          route = built
+          ends = pair
+          editable = true
+        end
+      end
       roads[#roads + 1] = {
         id = tostring(r.id or r.a or ""),
+        user = r.user == true,
+        editable = editable,
+        ends = ends,
         mark = mark,
-        route = type(r.route_crs) == "table" and r.route_crs[1] and r.route_crs or nil,
+        route = route,
         a = a and { id = tostring(a.id or r.a), to_level = a.to_level, density = da } or nil,
         b = b and { id = tostring(b.id or r.b), to_level = b.to_level, density = db } or nil,
       }
     end
+    end
   end
+  local gateMarks = {}
+  for _, g in ipairs(portals.gates or {}) do
+    if g.from_level == level then
+      local crs = g.map_mark and g.map_mark.crs
+      if g.user then
+        crs = userGateMarkCrs(g) or crs
+      end
+      local hidden = g.discoverable == true
+      local found = discoveredPortals[tostring(g.id)] == true
+      if type(crs) == "table" and crs[1] and (not hidden or found) then
+        gateMarks[#gateMarks + 1] = {
+          id = tostring(g.id),
+          crs = { tonumber(crs[1]), tonumber(crs[2]) },
+          discovered = hidden and found or false,
+        }
+      end
+    end
+  end
+  local graphNow = readGraph()
   local maps = {}
   local levels = (portals.map and portals.map.levels) or {}
   for id, rec in pairs(levels) do
@@ -1708,6 +3034,7 @@ local function getTrafficMap()
     local wx = (id == level) and hereWeather or classifyWeatherSim(id, t, seed)
     maps[#maps + 1] = {
       id = tostring(id),
+      title = levelTitle(id),
       crs = rec.crs,
       weather = wx,
       traffic = classifyTraffic(dens),
@@ -1726,8 +3053,62 @@ local function getTrafficMap()
     map = portals.map,
     maps = maps,
     roads = roads,
+    gate_marks = gateMarks,
     setup = setupState(),
+    view = regionView(graphNow),
+    region = regionCatalog(graphNow),
   }
+end
+
+do
+local function requestPartConditions()
+  carry.token = carry.token + 1
+  local token = carry.token
+  carry.readyDamage = false
+  carry.readyFuel = false
+  carry.ready = false
+  local veh = playerVehicle()
+  if not veh or not core_vehicleBridge or not core_vehicleBridge.requestValue then
+    carry.readyDamage = true
+    carry.readyFuel = true
+    carry.ready = true
+    return
+  end
+  core_vehicleBridge.requestValue(veh, function(res)
+    if token ~= carry.token then
+      return
+    end
+    local result = res and res.result
+    if type(result) == "table" then
+      carry.conditions = result
+    else
+      carry.conditions = false
+    end
+    carry.readyDamage = true
+    carry.ready = carry.readyDamage and carry.readyFuel
+  end, "getPartConditions")
+  core_vehicleBridge.requestValue(veh, function(res)
+    if token ~= carry.token then
+      return
+    end
+    local list = res and (res[1] or res.result)
+    local fuel = {}
+    if type(list) == "table" then
+      for _, row in ipairs(list) do
+        if type(row) == "table" and type(row.name) == "string" and type(row.currentEnergy) == "number" then
+          fuel[#fuel + 1] = { name = row.name, energy = row.currentEnergy }
+        end
+      end
+    end
+    carry.fuel = fuel[1] and fuel or false
+    carry.readyFuel = true
+    carry.ready = carry.readyDamage and carry.readyFuel
+  end, "energyStorage")
+end
+carry.request = requestPartConditions
+M.onCarrySaved = function()
+  carry.beamSaved = true
+end
 end
 
 local function queueSwitch(gate)
@@ -1747,10 +3128,32 @@ local function queueSwitch(gate)
   }
   writeSession(session)
   log("I", "alpine_rt", "Queued switch " .. tostring(gate.from_level) .. " -> " .. tostring(gate.to_level) .. " weather " .. tostring(wx))
-  switchQueued = {
+  carry.hold = {
+    since = now(),
     to_level = gate.to_level,
     vehicle = vehicle,
   }
+  carry.beamSaved = false
+  carry.request()
+  local vehNow = playerVehicle()
+  carry.passengers = nil
+  if vehNow and gameplay_seatOccupants and gameplay_seatOccupants.getSeats then
+    local seated = gameplay_seatOccupants.getSeats(vehNow:getID())
+    local dummies = {}
+    for _, seat in ipairs(seated or {}) do
+      if type(seat) == "table" and seat.occupantType == "dummy" and seat.seatId then
+        dummies[#dummies + 1] = { seatId = seat.seatId, weight = seat.weight }
+      end
+    end
+    if dummies[1] then
+      carry.passengers = dummies
+    end
+  end
+  if vehNow and vehNow.queueLuaCommand then
+    vehNow:queueLuaCommand('pcall(function() beamstate.save("settings/alpine_rt/vehicle_carry.json") end) obj:queueGameEngineLua("if extensions.alpinert and extensions.alpinert.onCarrySaved then extensions.alpinert.onCarrySaved() end")')
+  else
+    carry.beamSaved = true
+  end
 end
 
 local function doQueuedSwitch()
@@ -1810,6 +3213,21 @@ local function applyPendingRestore()
     if needReplace and core_vehicles and core_vehicles.replaceVehicle then
       core_vehicles.replaceVehicle(session.vehicle.model, { config = session.vehicle.config })
     end
+  end
+  carry.damage = nil
+  carry.fuelRestore = nil
+  if session.vehicle and type(session.vehicle.partConditions) == "table" then
+    carry.damage = session.vehicle.partConditions
+  end
+  if session.vehicle and type(session.vehicle.fuel) == "table" then
+    carry.fuelRestore = session.vehicle.fuel
+  end
+  carry.beamLoad = session.vehicle and session.vehicle.beamFile or nil
+  carry.arrive = pending.arrive
+  carry.passengersRestore = session.vehicle and type(session.vehicle.passengers) == "table" and session.vehicle.passengers or nil
+  if carry.damage or carry.fuelRestore or carry.beamLoad or carry.passengersRestore then
+    carry.damageTries = 0
+    carry.damageVid = nil
   end
   teleportToArrive(pending.arrive)
   if pending.weather then
@@ -1903,6 +3321,9 @@ local function onExtensionLoaded()
   math.randomseed(os.time())
   hideAllArcs()
   ensureJbWeather()
+  if currentLevel() then
+    worldReady = true
+  end
   log("I", "alpine_rt", "extension loaded " .. LUA_REV)
   uiMsg("Alpine Roadtrip Lua " .. LUA_REV, 4)
 end
@@ -1934,6 +3355,12 @@ local function onClientEndMission()
   trafficSpawnedFor = nil
   trafficWait = 0
   fanRotors = nil
+  userBoxIds = {}
+  waterStageFor = nil
+  waterStageLevel = nil
+  waterStageMonth = nil
+  waterFileLevel = nil
+  waterFileData = nil
   hideAllArcs()
 end
 
@@ -1980,6 +3407,8 @@ local function ensureTestTraffic(level)
     return
   end
   trafficSpawnedFor = level
+  -- 0.40 still takes (amount, {activeAmount}). The pause menu's parking count is a
+  -- different path (trafficParkingAmount) and is not part of this test pool.
   local ok, err = pcall(function()
     gameplay_traffic.setupTraffic(spec.cars, { activeAmount = spec.active or spec.cars })
   end)
@@ -1992,6 +3421,97 @@ local function ensureTestTraffic(level)
 end
 
 local function onUpdate(dtReal, dtSim)
+  if carry.hold then
+    if (carry.ready and carry.beamSaved) or (now() - carry.hold.since) > 2.0 then
+      local cond = nil
+      if type(carry.conditions) == "table" then
+        cond = jsonClone(carry.conditions) or carry.conditions
+      end
+      local fuel = nil
+      if type(carry.fuel) == "table" then
+        fuel = jsonClone(carry.fuel) or carry.fuel
+      end
+      local session = readSession()
+      if session and session.vehicle then
+        session.vehicle.partConditions = cond
+        session.vehicle.fuel = fuel
+        session.vehicle.beamFile = carry.beamSaved and true or nil
+        session.vehicle.passengers = type(carry.passengers) == "table" and (jsonClone(carry.passengers) or carry.passengers) or nil
+        writeSession(session)
+      end
+      if carry.hold.vehicle then
+        carry.hold.vehicle.partConditions = cond
+        carry.hold.vehicle.fuel = fuel
+      end
+      log("I", "alpine_rt", "Carrying vehicle state damage=" .. tostring(cond ~= nil) .. " fuel=" .. tostring(fuel ~= nil) .. " beams=" .. tostring(carry.beamSaved == true) .. " passengers=" .. tostring(type(carry.passengers) == "table" and #carry.passengers or 0))
+      switchQueued = {
+        to_level = carry.hold.to_level,
+        vehicle = carry.hold.vehicle,
+      }
+      carry.hold = nil
+      carry.ready = false
+      carry.conditions = nil
+      carry.fuel = nil
+    end
+    return
+  end
+  if carry.damage or carry.fuelRestore or carry.beamLoad or carry.passengersRestore then
+    local veh = playerVehicle()
+    if veh then
+      local vid = veh.getID and veh:getID() or 0
+      if vid ~= carry.damageVid then
+        carry.damageVid = vid
+        carry.damageTries = 0
+      end
+      local damage = carry.damage
+      local fuel = carry.fuelRestore
+      if core_vehicleBridge and core_vehicleBridge.executeAction then
+        pcall(function()
+          if type(damage) == "table" and carry.damageTries < 8 then
+            core_vehicleBridge.executeAction(veh, "initPartConditions", damage, 0, 1, 1)
+          end
+          if type(fuel) == "table" then
+            for _, row in ipairs(fuel) do
+              if type(row) == "table" and row.name and row.energy then
+                core_vehicleBridge.executeAction(veh, "setEnergyStorageEnergy", row.name, row.energy)
+              end
+            end
+          end
+        end)
+      end
+      if carry.beamLoad and veh.queueLuaCommand and (carry.damageTries == 8 or carry.damageTries == 16) then
+        veh:queueLuaCommand('pcall(function() beamstate.load("settings/alpine_rt/vehicle_carry.json") end)')
+      end
+      if carry.arrive and (carry.damageTries == 10 or carry.damageTries == 18) then
+        teleportToArrive(carry.arrive)
+      end
+      if carry.passengersRestore and gameplay_seatOccupants and gameplay_seatOccupants.setDummyOccupant and carry.damageTries >= 12 then
+        local reseatId = vid
+        local passengers = carry.passengersRestore
+        pcall(function()
+          for _, seat in ipairs(passengers) do
+            if type(seat) == "table" and seat.seatId then
+              gameplay_seatOccupants.setDummyOccupant(reseatId, seat.seatId, seat.weight)
+            end
+          end
+          if core_vehicleBridge and core_vehicleBridge.executeAction then
+            core_vehicleBridge.executeAction(veh, "latchesClose")
+          end
+        end)
+      end
+      carry.damageTries = carry.damageTries + 1
+      if carry.damageTries >= 20 then
+        carry.damage = nil
+        carry.fuelRestore = nil
+        carry.beamLoad = nil
+        carry.arrive = nil
+        log("I", "alpine_rt", "Vehicle damage and fuel applied")
+      end
+      if carry.damageTries >= 36 then
+        carry.passengersRestore = nil
+      end
+    end
+  end
   if switchQueued then
     doQueuedSwitch()
     return
@@ -2016,6 +3536,13 @@ local function onUpdate(dtReal, dtSim)
     return
   end
   ensureTestTraffic(level)
+  pcall(ensureWaterStage)
+  local okBox, errBox = pcall(syncUserBoxes, level)
+  pcall(placeMovedBoxes, level)
+  if not okBox and errBox ~= userBoxErr then
+    userBoxErr = errBox
+    log("E", "alpine_rt", "user box " .. tostring(errBox))
+  end
   pcall(drawUserPortals, level)
   if graceUntil > now() then
     hideAllArcs()
@@ -2053,6 +3580,19 @@ local function onUpdate(dtReal, dtSim)
 
   if inside.user then
     ensureUserArc(inside)
+  end
+  if freshPortal.id and inside.id == freshPortal.id and now() < freshPortal.untilT then
+    if inside.user then
+      drawGateArc(inside)
+    end
+    dwellGate = nil
+    dwellAcc = 0
+    dwellNeed = 0
+    return
+  end
+  if now() - (carry.requested or 0) > 0.4 then
+    carry.requested = now()
+    carry.request()
   end
 
   if not dwellGate or dwellGate.id ~= inside.id then
@@ -2100,14 +3640,20 @@ local function onUpdate(dtReal, dtSim)
   end
   local remain = math.max(0, need - dwellAcc)
   local sec = math.ceil(remain)
-  if sec ~= lastMsgS or (paused and dwellMsgHold <= 0 and remain > 0.05) then
+  local gid = tostring(inside.id)
+  if inside.discoverable and not discoveredPortals[gid] and dwellAcc >= 1 then
+    discoveredPortals[gid] = true
+    uiMsg("Hidden portal to " .. destName(inside) .. " discovered", 4)
+    discoverNoticeUntil = now() + 3.5
+    lastMsgS = -1
+  end
+  if now() >= discoverNoticeUntil and (sec ~= lastMsgS or (paused and dwellMsgHold <= 0 and remain > 0.05)) then
     if paused then
       dwellMsgHold = 0.4
     end
     lastMsgS = sec
-    local label = inside.label or inside.id
     if remain > 0.05 then
-      uiMsg(string.format("%s — switching in %ds", label, sec), paused and 0.5 or 1.05)
+      uiMsg(string.format("Travelling to %s — %ds", destName(inside), sec), paused and 0.5 or 1.05)
     end
   end
 
@@ -2116,7 +3662,7 @@ local function onUpdate(dtReal, dtSim)
     dwellAcc = 0
     dwellNeed = 0
     hideAllArcs()
-    uiMsg((inside.label or "Portal") .. " — loading map", 2)
+    uiMsg("Travelling to " .. destName(inside), 2)
     queueSwitch(inside)
   end
 end
@@ -2152,5 +3698,18 @@ M.defineLocation = defineLocation
 M.placePortal = placePortal
 M.placeReturn = placeReturn
 M.listLevels = listLevels
+M.saveRegion = saveRegion
+M.listRegions = listRegions
+M.loadRegion = loadRegion
+M.setRegionProvider = setRegionProvider
+M.redrawRegion = redrawRegion
+M.setUserLink = setUserLink
+M.onTileDownload = onTileDownload
+M.fetchRegionTiles = fetchRegionTiles
+M.regionTiles = regionTiles
+M.moveUserGate = moveUserGate
+M.removeUserGate = removeUserGate
+M.removeLocation = removeLocation
+M.applyWaterStage = applyWaterStage
 
 return M

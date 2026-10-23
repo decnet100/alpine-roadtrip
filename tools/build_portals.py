@@ -74,6 +74,49 @@ def _bbox_center_crs(site: dict) -> tuple[float, float]:
     return 0.5 * (xmin + xmax), 0.5 * (ymin + ymax)
 
 
+def _site_crs(site: dict | None) -> str:
+    if not site:
+        return "EPSG:31254"
+    return str(site.get("crs") or "EPSG:31254")
+
+
+def _transform_xy(
+    x: float, y: float, from_crs: str, to_crs: str
+) -> tuple[float, float]:
+    """Reproject a planimetric point. Same CRS is a no-op."""
+    if from_crs == to_crs:
+        return float(x), float(y)
+    from pyproj import Transformer
+
+    tr = Transformer.from_crs(from_crs, to_crs, always_xy=True)
+    ox, oy = tr.transform(float(x), float(y))
+    return float(ox), float(oy)
+
+
+def _site_xy_to_crs(site: dict, x: float, y: float, to_crs: str) -> tuple[float, float]:
+    return _transform_xy(x, y, _site_crs(site), to_crs)
+
+
+def _site_bbox_corners_in_crs(site: dict, to_crs: str) -> list[float] | None:
+    raw = site.get("bbox")
+    if not raw or len(raw) < 4:
+        return None
+    xmin, ymin, xmax, ymax = map(float, raw[:4])
+    corners = (
+        (xmin, ymin),
+        (xmin, ymax),
+        (xmax, ymin),
+        (xmax, ymax),
+    )
+    xs: list[float] = []
+    ys: list[float] = []
+    for x, y in corners:
+        ox, oy = _site_xy_to_crs(site, x, y, to_crs)
+        xs.append(ox)
+        ys.append(oy)
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
 def _processed_dir(site: dict) -> Path:
     slug = str(site.get("name", "default")).replace(" ", "_")
     return terrain_root() / "data" / "processed" / slug
@@ -196,7 +239,7 @@ def _route_crs(raw_road: dict, a: dict, b: dict | None, map_cfg: dict) -> list[l
     b_crs = (b.get("map_mark") or {}).get("crs")
     if not a_crs or not b_crs or len(a_crs) < 2 or len(b_crs) < 2:
         return None
-    crs_name = str(map_cfg.get("crs") or "EPSG:31254")
+    crs_name = str(map_cfg.get("crs") or "EPSG:3857")
     controls: list[tuple[float, float]] = [(float(a_crs[0]), float(a_crs[1]))]
     parsed = _normalize_via(raw_road)
     if parsed:
@@ -381,14 +424,17 @@ def compute_gate_arc(
         dbx, dby, dbz = dest_portal
         dest_sc = SiteCoords(to_site)
         crs_x, crs_y = dest_sc.beamng_to_crs(dbx, dby)
-        end_bx, end_by = sc.crs_to_beamng(crs_x, crs_y)
+        # Dest may use another working CRS (e.g. EPSG:25832 vs EPSG:31254).
+        fx, fy = _transform_xy(crs_x, crs_y, dest_sc.crs, sc.crs)
+        end_bx, end_by = sc.crs_to_beamng(fx, fy)
         end_kind = "portal"
         if target_z_override is not None:
             end_z = float(target_z_override) - _from_z_min(from_site)
         else:
             end_z = _portal_abs_z(to_site, dbz) - _from_z_min(from_site)
     else:
-        end_bx, end_by = sc.crs_to_beamng(*dest_crs)
+        fx, fy = _transform_xy(dest_crs[0], dest_crs[1], _site_crs(to_site), sc.crs)
+        end_bx, end_by = sc.crs_to_beamng(fx, fy)
         if target_z_override is not None:
             end_z = float(target_z_override) - _from_z_min(from_site)
         else:
@@ -397,6 +443,7 @@ def compute_gate_arc(
     length_full = math.hypot(span_x, span_y) or 1.0
     dx, dy = _norm2(span_x, span_y)
     end_crs = sc.beamng_to_crs(end_bx, end_by)
+    # Geographic chord in a common CRS (source site CRS after reproject).
     geo_d = math.hypot(end_crs[0] - portal_crs[0], end_crs[1] - portal_crs[1]) or 1.0
     # Optional cap for tests; default = span to the chosen end.
     length_m = float(arc_cfg["length_m"]) if arc_cfg.get("length_m") is not None else length_full
@@ -533,6 +580,7 @@ def load_portals_yaml(path: Path | None = None) -> dict:
             "from_level": str(g["from_level"]),
             "to_level": str(g["to_level"]),
             "label": str(g.get("label") or g["id"]),
+            "discoverable": bool(g.get("discoverable")),
             "dwell_s": float(g.get("dwell_s") if g.get("dwell_s") is not None else default_dwell),
             "box": {
                 "pos": [round(pos[0], 3), round(pos[1], 3), round(pos[2], 3)],
@@ -588,8 +636,12 @@ def load_portals_yaml(path: Path | None = None) -> dict:
         out_gates.append(gate)
     involved = sorted({g["from_level"] for g in out_gates} | {g["to_level"] for g in out_gates})
     map_out = dict(map_cfg)
+    from fetch_overview_basemap import apply_source_metadata  # noqa: WPS433
+
+    map_out = apply_source_metadata(map_out)
+    map_crs = str(map_out.get("crs") or "EPSG:3857")
     if not map_out.get("bbox"):
-        ub = _union_site_bbox(sites, involved)
+        ub = _union_site_bbox(sites, involved, map_crs=map_crs)
         if ub:
             map_out["content_bbox"] = ub
             aspect = map_out.get("image_aspect")
@@ -601,9 +653,6 @@ def load_portals_yaml(path: Path | None = None) -> dict:
                 map_out["bbox"] = ub
     if not map_out.get("image"):
         map_out["image"] = "/ui/modules/apps/alpineRtTrafficMap/basemap.png"
-    from fetch_overview_basemap import apply_source_metadata  # noqa: WPS433
-
-    map_out = apply_source_metadata(map_out)
     side = str(map_out.get("driving_side") or "right").strip().lower()
     if side not in ("right", "left"):
         side = "right"
@@ -619,10 +668,9 @@ def load_portals_yaml(path: Path | None = None) -> dict:
     aspect = map_out.get("image_aspect")
     for ln in involved:
         site = sites.get(ln) or {}
-        raw = site.get("bbox")
-        if not raw or len(raw) < 4:
+        content = _site_bbox_corners_in_crs(site, map_crs)
+        if not content:
             continue
-        content = [float(v) for v in raw[:4]]
         box = content
         if aspect:
             from fetch_overview_basemap import expand_bbox_to_aspect  # noqa: WPS433
@@ -650,18 +698,25 @@ def _center_distance_m(from_site: dict | None, to_site: dict | None) -> float | 
         return None
     ax, ay = _bbox_center_crs(from_site)
     bx, by = _bbox_center_crs(to_site)
+    # Project both centres into the destination CRS so mixed sites stay metric.
+    ax, ay = _site_xy_to_crs(from_site, ax, ay, _site_crs(to_site))
     return math.hypot(bx - ax, by - ay)
 
 
-def _union_site_bbox(sites: dict[str, dict], levels: list[str]) -> list[float] | None:
+def _union_site_bbox(
+    sites: dict[str, dict],
+    levels: list[str],
+    *,
+    map_crs: str = "EPSG:3857",
+) -> list[float] | None:
     xs: list[float] = []
     ys: list[float] = []
     for ln in levels:
         site = sites.get(ln) or {}
-        raw = site.get("bbox")
-        if not raw or len(raw) < 4:
+        box = _site_bbox_corners_in_crs(site, map_crs)
+        if not box:
             continue
-        xmin, ymin, xmax, ymax = map(float, raw[:4])
+        xmin, ymin, xmax, ymax = box
         xs.extend((xmin, xmax))
         ys.extend((ymin, ymax))
     if not xs:
@@ -687,15 +742,18 @@ def _gate_map_mark(
     gap_px = float(raw.get("gap_px") if raw.get("gap_px") is not None else map_cfg.get("mark_gap_px") or 5)
     crs = raw.get("crs")
     heading = raw.get("heading")
+    map_crs = str(map_cfg.get("crs") or "EPSG:3857")
     if from_site is not None and (crs is None or heading is None):
         sc = SiteCoords(from_site)
         box = gate["box"]
-        portal_crs = sc.beamng_to_crs(float(box["pos"][0]), float(box["pos"][1]))
+        portal_site = sc.beamng_to_crs(float(box["pos"][0]), float(box["pos"][1]))
+        portal_crs = _site_xy_to_crs(from_site, portal_site[0], portal_site[1], map_crs)
         if crs is None:
             crs = [round(portal_crs[0], 1), round(portal_crs[1], 1)]
         if heading is None:
             if to_site is not None:
                 dest = _bbox_center_crs(to_site)
+                dest = _site_xy_to_crs(to_site, dest[0], dest[1], map_crs)
                 hx, hy = dest[0] - portal_crs[0], dest[1] - portal_crs[1]
             else:
                 # BeamNG tangent is only a fallback; CRS heading is preferred.
@@ -720,6 +778,7 @@ def _level_short(level_name: str) -> str:
         .replace("autoroad_", "")
         .replace("_8192", "")
         .replace("_4096", "")
+        .replace("_2048", "")
     )
 
 
@@ -802,6 +861,8 @@ def _road_payload(raw_road: dict, a: dict, b: dict | None, map_cfg: dict) -> dic
         "a": a["id"],
         "b": b["id"] if b else None,
     }
+    if a.get("discoverable") or (b and b.get("discoverable")):
+        road["discoverable"] = True
     if crs is not None:
         road["map_mark"] = {
             "crs": [round(crs[0], 1), round(crs[1], 1)],
@@ -917,6 +978,7 @@ def write_schematic_basemap(cfg: dict) -> None:
     sites = _sites_by_level()
     levels = {g["from_level"] for g in (cfg.get("gates") or [])}
     levels |= {g["to_level"] for g in (cfg.get("gates") or [])}
+    map_crs = str(map_cfg.get("crs") or "EPSG:3857")
 
     def to_px(e: float, n: float) -> tuple[int, int]:
         u = (e - xmin) / span_x
@@ -927,8 +989,8 @@ def write_schematic_basemap(cfg: dict) -> None:
     outline = (110, 128, 112)
     for ln in sorted(levels):
         site = sites.get(ln) or {}
-        raw = site.get("bbox")
-        if not raw or len(raw) < 4:
+        raw = _site_bbox_corners_in_crs(site, map_crs)
+        if not raw:
             continue
         x0, y0, x1, y1 = map(float, raw[:4])
         p0 = to_px(x0, y0)
@@ -1509,8 +1571,10 @@ def _level_short_name(level_name: str, sites: dict[str, dict]) -> str:
         "autoroad_m28_test": "Hahntennjoch",
         "autoroad_fernpass_8192": "Fernpass",
         "autoroad_fernpass_4096": "Fernpass",
+        "imst_tarrenz": "Imst-Tarrenz",
         "autoroad_imst_8192": "Imst",
         "autoroad_reschen_8192": "Reschen",
+        "Timmelsjoch_2048": "Timmelsjoch",
     }
     if level_name in aliases:
         return aliases[level_name]
@@ -1680,9 +1744,10 @@ def main() -> None:
         if need > 0:
             ensure_visible_distance(level, need)
     for level, gates in to_levels.items():
-        inject_arrivals(level, gates)
+        visible = [g for g in gates if not g.get("discoverable")]
+        inject_arrivals(level, visible)
         ensure_named_default_spawn(level)
-        patch_info_spawn_points(level, gates, sites)
+        patch_info_spawn_points(level, visible, sites)
 
     active = set(from_levels) | set(to_levels)
     if USER_LEVELS.is_dir():

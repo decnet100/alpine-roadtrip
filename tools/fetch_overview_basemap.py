@@ -1,6 +1,6 @@
 """Fetch a georeferenced overview PNG for the Alpine Roadtrip HUD map.
 
-The image is north-up in the portal ``map.bbox`` CRS (EPSG:31254 for Tirol).
+The image is north-up in the portal ``map.bbox`` CRS (EPSG:3857, the WMTS tile CRS).
 HUD pixels use the same affine as the site masks:
 
     u = (easting  - xmin) / (xmax - xmin)
@@ -324,14 +324,14 @@ def fetch_overview_basemap(
     if spec is None:
         print(f"Unknown overview source {source_id!r} (known: {', '.join(SOURCES)})")
         return None
-    if spec.get("kind") != "wmts_z_row_col":
+    if spec.get("kind") not in {"wmts_z_row_col", "wmts_z_col_row"}:
         print(f"Overview source {source_id} is not wired yet ({spec.get('kind')})")
         return None
     bbox = list(map_cfg.get("bbox") or [])
     if len(bbox) < 4:
         print("map.bbox missing, skip overview fetch")
         return None
-    crs = str(map_cfg.get("crs") or "EPSG:31254")
+    crs = str(map_cfg.get("crs") or "EPSG:3857")
     dest = dest or MOD_APP / "basemap.png"
     long_edge = int(map_cfg.get("long_edge_px") or 1800)
     max_tiles = int(map_cfg.get("max_tiles") or 80)
@@ -396,7 +396,7 @@ def apply_source_metadata(map_cfg: dict) -> dict:
     out = dict(map_cfg)
     source_id = str(out.get("source") or "basemap_at").strip().lower()
     spec = SOURCES.get(source_id) or {}
-    out.setdefault("crs", "EPSG:31254")
+    out.setdefault("crs", "EPSG:3857")
     if spec.get("attribution") and not out.get("attribution"):
         out["attribution"] = spec["attribution"]
     if spec.get("license") and not out.get("license"):
@@ -419,7 +419,8 @@ def main() -> None:
         levels = sorted(
             {str(g["from_level"]) for g in gates} | {str(g["to_level"]) for g in gates}
         )
-        union = _union_site_bbox(_sites_by_level(), levels)
+        map_crs = str(map_cfg.get("crs") or "EPSG:3857")
+        union = _union_site_bbox(_sites_by_level(), levels, map_crs=map_crs)
         aspect = map_cfg.get("image_aspect")
         map_cfg["bbox"] = expand_bbox_to_aspect(union, float(aspect)) if aspect and union else union
     dest = fetch_overview_basemap(map_cfg, force=args.force)

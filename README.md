@@ -17,9 +17,11 @@ Concept and gates: [docs/ALPINE_ROADTRIP.md](docs/ALPINE_ROADTRIP.md). In-game r
 | `mods/autoroad_alpine_rt/` | GE mod (Lua, HUD, portal meshes) |
 | `tools/build_portals.py` | Writes `portals.json`, arcs, and level inject |
 | `tools/deploy_alpine_rt_mod.py` | Copy or junction into BeamNG unpacked mods |
-| `tools/fetch_overview_basemap.py` | basemap.at overview for the HUD |
+| `tools/fetch_overview_basemap.py` | One basemap.at overview PNG for the HUD |
+| `tools/fetch_region_tiles.py` | Region tiles plus a 100 km buffer, all providers, for the HUD to composite |
 | `tools/write_map_icons.py` | Weather and traffic icons |
-| `settings/alpine_rt/graph.json` | Maps and portals added in-game (BeamNG user folder, not in git) |
+| `settings/alpine_rt/graph.json` | Live user overlay: placed maps, portals, WMTS provider (BeamNG user folder, not in git) |
+| `settings/alpine_rt/regions/<name>.json` | Named copy of that overlay, saved from Region Setup |
 
 `build_portals.py` reads site YAML and heightmaps from a terrain-worker checkout (`config/sites`, `data/processed`). It does not generate terrain.
 

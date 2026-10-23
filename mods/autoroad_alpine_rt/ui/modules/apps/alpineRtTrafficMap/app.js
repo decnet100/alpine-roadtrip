@@ -2,35 +2,46 @@
 // UI App: renders a simple map-like polyline view with low/medium/high traffic colouring.
 angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
   var tpl = ''
-    + '<div class="artm">'
+    + '<div class="artm" ng-class="{collapsed: collapsed}">'
     + '  <style>'
     + '  .artm{font-family:"Cairo","Overpass",system-ui,sans-serif;color:#dfe2e6;background:rgba(18,20,24,0.90);'
     + '       border:1px solid rgba(255,255,255,0.07);border-top:2px solid #ff6600;border-radius:5px;'
     + '       height:100%;width:100%;box-sizing:border-box;display:flex;flex-direction:column;'
     + '       overflow:hidden;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);}'
     + '  .artm *{box-sizing:border-box;}'
+    + '  .artm.collapsed{height:auto;background:transparent;border-color:transparent;backdrop-filter:none;-webkit-backdrop-filter:none;}'
+    + '  .artm.collapsed .artm-head{background:rgba(18,20,24,0.92);border:1px solid rgba(255,255,255,0.07);'
+    + '            border-top:2px solid #ff6600;border-radius:5px;pointer-events:auto;}'
+    + '  .artm.collapsed .artm-sub,.artm.collapsed .artm-body{display:none;}'
     + '  .artm-head{display:flex;align-items:center;justify-content:space-between;padding:10px 11px;'
-    + '            border-bottom:1px solid rgba(255,255,255,0.06);}'
+    + '            border-bottom:1px solid rgba(255,255,255,0.06);pointer-events:auto;}'
     + '  .artm-brand{display:flex;align-items:center;min-width:0;}'
     + '  .artm-slash{width:6px;height:16px;background:#ff6600;transform:skewX(-16deg);margin-right:9px;flex:none;}'
     + '  .artm-title{font-style:italic;font-weight:800;font-size:13px;letter-spacing:.3px;color:#f4f6f8;white-space:nowrap;}'
     + '  .artm-sub{padding:7px 11px 0;color:#8b9198;font-size:11px;display:flex;flex-wrap:wrap;}'
     + '  .artm-sub span{margin:0 10px 4px 0;}'
     + '  .artm-sub b{color:#dfe2e6;font-weight:700;}'
-    + '  .artm-body{padding:10px 11px 11px;display:flex;flex-direction:column;gap:8px;flex:1;min-height:0;}'
-    + '  .artm-can{width:100%;flex:1;border:1px solid rgba(255,255,255,0.08);border-radius:4px;background:rgba(0,0,0,0.18);}'
+    + '  .artm-body{padding:10px 11px 11px;display:flex;flex-direction:column;gap:8px;flex:1;min-height:0;overflow:hidden;}'
+    + '  .artm-can{display:block;width:100%;flex:1 1 0;min-height:72px;border:1px solid rgba(255,255,255,0.08);border-radius:4px;background:rgba(0,0,0,0.18);cursor:grab;}'
+    + '  .artm-can.edit{cursor:crosshair;}'
+    + '  .artm-can.panning{cursor:grabbing;}'
+    + '  .artm-panel{flex:0 1 auto;min-height:0;max-height:52%;overflow:auto;display:flex;flex-direction:column;gap:6px;}'
     + '  .artm-leg{display:flex;align-items:center;gap:10px;font-size:11px;color:#9aa3ae;}'
     + '  .artm-dot{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:6px;transform:skewX(-12deg);}'
-    + '  .artm-row{display:flex;align-items:center;justify-content:space-between;gap:10px;}'
+    + '  .artm-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex:none;}'
     + '  .artm-btn{font-family:inherit;font-size:11px;font-weight:700;letter-spacing:.5px;border-radius:3px;padding:7px 10px;'
     + '           cursor:pointer;border:1px solid rgba(255,255,255,0.11);background:rgba(255,255,255,0.06);color:#dfe2e6;transition:all .12s;margin-left:6px;}'
     + '  .artm-btn:hover{background:rgba(255,255,255,0.12);}'
-    + '  .artm-tools{display:flex;flex-wrap:wrap;gap:6px;}'
-    + '  .artm-form{display:flex;flex-direction:column;gap:6px;}'
-    + '  .artm-form input{font:inherit;font-size:12px;padding:6px 8px;border-radius:3px;'
+    + '  .artm-btn.on{background:rgba(255,102,0,0.28);border-color:rgba(255,102,0,0.55);color:#fff;}'
+    + '  .artm-btn:disabled{opacity:0.4;cursor:default;}'
+    + '  .artm-tools{display:flex;flex-wrap:wrap;gap:6px;flex:none;}'
+    + '  .artm-tools .artm-btn{margin-left:0;}'
+    + '  .artm-select{font:inherit;font-size:11px;font-weight:700;padding:6px 8px;border-radius:3px;'
+    + '       border:1px solid rgba(255,255,255,0.11);background:rgba(0,0,0,0.28);color:#dfe2e6;}'
+    + '  .artm-panel input{font:inherit;font-size:12px;padding:6px 8px;border-radius:3px;'
     + '       border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.28);color:#dfe2e6;width:100%;}'
     + '  .artm-q{font-size:11px;color:#c5cad1;line-height:1.35;}'
-    + '  .artm-note{font-size:11px;color:#ffb020;min-height:14px;line-height:1.35;}'
+    + '  .artm-note{font-size:11px;color:#ffb020;line-height:1.35;flex:none;}'
     + '  .artm-list{max-height:132px;overflow:auto;display:flex;flex-direction:column;gap:4px;}'
     + '  .artm-item{font:inherit;font-size:12px;text-align:left;padding:6px 8px;border-radius:3px;cursor:pointer;'
     + '       border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.04);color:#dfe2e6;}'
@@ -40,54 +51,27 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     + '  <div class="artm-head">'
     + '    <div class="artm-brand"><span class="artm-slash"></span><span class="artm-title">ALPINE ROADTRIP MAP</span></div>'
     + '    <div>'
-    + '      <button class="artm-btn" ng-click="toggleZoom()">{{zoomed ? "Overview" : "Zoom"}}</button>'
-    + '      <button class="artm-btn" ng-click="refresh()">Refresh</button>'
+    + '      <button class="artm-btn" ng-click="toggleCollapse()">{{collapsed ? "Show" : "Hide"}}</button>'
+    + '      <button class="artm-btn" ng-click="toggleZoom()" ng-if="!collapsed">{{zoomed ? "Overview" : "Zoom"}}</button>'
+    + '      <button class="artm-btn" ng-click="refresh()" ng-if="!collapsed">Refresh</button>'
     + '    </div>'
     + '  </div>'
     + '  <div class="artm-sub">'
     + '    <span>Level <b>{{state.level || "-"}}</b></span>'
     + '    <span ng-if="state.lua_rev">Lua <b>{{state.lua_rev}}</b></span>'
     + '    <span ng-if="state.roads">Roads <b>{{state.roads.length}}</b></span>'
+    + '    <span ng-if="editLine && editLabel">{{editLabel}}. Drag an orange midpoint. Right-click removes a point.</span>'
+    + '    <span ng-if="editLine && !editLabel">Pick a route in Region Setup, or click its line.</span>'
+    + '    <span ng-if="!editLine && !zoomed">Drag to pan. Wheel zooms.</span>'
     + '  </div>'
     + '  <div class="artm-body">'
-    + '    <canvas class="artm-can"></canvas>'
-    + '    <div class="artm-tools">'
-    + '      <button class="artm-btn" ng-click="openDefine()">Define map</button>'
-    + '      <button class="artm-btn" ng-click="openPortal()">New portal</button>'
-    + '      <button class="artm-btn" ng-click="openReturn()" ng-if="state.setup && state.setup.open_returns && state.setup.open_returns.length">Return ({{state.setup.open_returns.length}})</button>'
-    + '    </div>'
-    + '    <div class="artm-form" ng-if="panel===\'define\'">'
-    + '      <div class="artm-q" ng-if="state.setup && state.setup.authority">CRS {{state.setup.authority}}</div>'
-    + '      <div class="artm-note" ng-if="state.lua_rev && !(state.setup && state.setup.authority)">No map CRS authority is configured. This map cannot be added.</div>'
-    + '      <input ng-model="form.name" placeholder="Location name">'
-    + '      <input ng-model="form.lat" placeholder="Latitude (WGS84)">'
-    + '      <input ng-model="form.lon" placeholder="Longitude (WGS84)">'
-    + '      <div class="artm-q">In which direction is your vehicle currently pointing?</div>'
-    + '      <div class="artm-tools">'
-    + '        <button class="artm-btn" ng-click="saveLocation(\'north\')" ng-disabled="!(state.setup && state.setup.authority)">Roughly north</button>'
-    + '        <button class="artm-btn" ng-click="saveLocation(\'east\')" ng-disabled="!(state.setup && state.setup.authority)">Roughly east</button>'
-    + '        <button class="artm-btn" ng-click="saveLocation(\'south\')" ng-disabled="!(state.setup && state.setup.authority)">Roughly south</button>'
-    + '        <button class="artm-btn" ng-click="saveLocation(\'west\')" ng-disabled="!(state.setup && state.setup.authority)">Roughly west</button>'
-    + '      </div>'
-    + '    </div>'
-    + '    <div class="artm-form" ng-if="panel===\'portal\'">'
-    + '      <input ng-model="levelQuery" placeholder="Filter maps">'
-    + '      <div class="artm-list">'
-    + '        <button class="artm-item" ng-repeat="lv in filteredLevels()" ng-click="choosePortal(lv)">{{lv.title}}<small>{{lv.id}}</small></button>'
-    + '      </div>'
-    + '    </div>'
-    + '    <div class="artm-form" ng-if="panel===\'return\'">'
-    + '      <div class="artm-q">Place the return portal at the vehicle, for a link that has no way back yet.</div>'
-    + '      <div class="artm-list">'
-    + '        <button class="artm-item" ng-repeat="link in state.setup.open_returns" ng-click="chooseReturn(link)">From {{link.label}}<small>{{link.from_level}}</small></button>'
-    + '      </div>'
-    + '    </div>'
     + '    <div class="artm-note" ng-if="note">{{note}}</div>'
+    + '    <canvas class="artm-can" ng-class="{edit: editLine}"></canvas>'
     + '    <div class="artm-row">'
     + '      <div class="artm-leg">weather + traffic</div>'
     + '      <div style="font-size:11px;color:#7a8088">'
-    + '        <span ng-if="state.map.attribution">{{state.map.attribution}}</span>'
-    + '        <span ng-if="state.now_s"> t={{state.t_s}}s</span>'
+    + '        <span ng-if="regionLabel">{{regionLabel}}</span>'
+    + '        <span ng-if="!regionLabel && state.map.attribution">{{state.map.attribution}}</span>'
     + '      </div>'
     + '    </div>'
     + '  </div>'
@@ -149,30 +133,34 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
       var zb = asBBox(rec && rec.content_bbox) || asBBox(rec && rec.bbox);
       if (zb) return zb;
     }
-    var cb = asBBox(state && state.map && state.map.content_bbox);
-    if (cb) return cb;
+    var box = asBBox(state && state.map && state.map.content_bbox);
+    function include(e, n) {
+      if (!isFinite(e) || !isFinite(n)) return;
+      if (!box) box = [e, n, e, n];
+      if (e < box[0]) box[0] = e;
+      if (n < box[1]) box[1] = n;
+      if (e > box[2]) box[2] = e;
+      if (n > box[3]) box[3] = n;
+    }
     var roads = (state && state.roads) ? state.roads : [];
-    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (var i = 0; i < roads.length; i++) {
       var mk = roads[i].mark;
-      if (mk && mk.crs && mk.crs.length >= 2) {
-        var e = Number(mk.crs[0]), n = Number(mk.crs[1]);
-        if (e < minX) minX = e; if (e > maxX) maxX = e;
-        if (n < minY) minY = n; if (n > maxY) maxY = n;
-      }
+      if (mk && mk.crs && mk.crs.length >= 2) include(Number(mk.crs[0]), Number(mk.crs[1]));
       var route = roads[i].route;
       if (route) {
         for (var r = 0; r < route.length; r++) {
           var p = route[r];
-          if (!p || p.length < 2) continue;
-          var re = Number(p[0]), rn = Number(p[1]);
-          if (re < minX) minX = re; if (re > maxX) maxX = re;
-          if (rn < minY) minY = rn; if (rn > maxY) maxY = rn;
+          if (p && p.length >= 2) include(Number(p[0]), Number(p[1]));
         }
       }
     }
-    if (!isFinite(minX)) return imageBBox(state, zoomed);
-    return [minX - 800, minY - 800, maxX + 800, maxY + 800];
+    var nodes = (state && state.maps) ? state.maps : [];
+    for (var n = 0; n < nodes.length; n++) {
+      var node = nodes[n];
+      if (node && node.crs && node.crs.length >= 2) include(Number(node.crs[0]), Number(node.crs[1]));
+    }
+    if (!box) return imageBBox(state, zoomed);
+    return box;
   }
 
   function expandToAspect(b, aspect, pad) {
@@ -210,9 +198,15 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     return out;
   }
 
-  function viewBBox(state, canvasW, canvasH, zoomed) {
-    var content = contentBBox(state, zoomed);
-    var imgB = imageBBox(state, zoomed);
+  function authoredBBox(state) {
+    return asBBox(state && state.map && state.map.content_bbox)
+      || asBBox(state && state.map && state.map.bbox);
+  }
+
+  function viewBBox(state, canvasW, canvasH, zoomed, clampB) {
+    var imgB = clampB || imageBBox(state, zoomed);
+    if (!zoomed && glance) return clampView(glance, imgB || glance);
+    var content = zoomed ? contentBBox(state, true) : (authoredBBox(state) || contentBBox(state, false));
     if (!content) return imgB;
     var aspect = Math.max(0.2, canvasW / Math.max(1, canvasH));
     return clampView(expandToAspect(content, aspect, 1.08), imgB || content);
@@ -248,7 +242,8 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     return [x / len, y / len];
   }
 
-  function drawLane(ctx, cx, cy, hx, hy, lengthPx, color) {
+  function drawLane(ctx, cx, cy, hx, hy, lengthPx, color, scale) {
+    scale = scale || 1;
     var u = unit2(hx, hy);
     hx = u[0]; hy = u[1];
     var hl = (lengthPx || 28) * 0.5;
@@ -258,11 +253,11 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     ctx.moveTo(cx - hx * hl, cy - hy * hl);
     ctx.lineTo(cx + hx * hl, cy + hy * hl);
     ctx.strokeStyle = 'rgba(0,0,0,0.55)';
-    ctx.lineWidth = 5.5;
+    ctx.lineWidth = 5.5 * scale;
     ctx.globalAlpha = 0.55;
     ctx.stroke();
     ctx.strokeStyle = color;
-    ctx.lineWidth = 3.2;
+    ctx.lineWidth = 3.2 * scale;
     ctx.globalAlpha = 0.95;
     ctx.stroke();
     ctx.globalAlpha = 1.0;
@@ -281,19 +276,20 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     return out;
   }
 
-  function strokePoly(ctx, pts, color) {
+  function strokePoly(ctx, pts, color, scale) {
     if (!pts || pts.length < 2) return;
+    scale = scale || 1;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.beginPath();
     ctx.moveTo(pts[0][0], pts[0][1]);
     for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
     ctx.strokeStyle = 'rgba(0,0,0,0.55)';
-    ctx.lineWidth = 6.5;
+    ctx.lineWidth = 6.5 * scale;
     ctx.globalAlpha = 0.4;
     ctx.stroke();
     ctx.strokeStyle = color;
-    ctx.lineWidth = 3.6;
+    ctx.lineWidth = 3.6 * scale;
     ctx.globalAlpha = 0.95;
     ctx.stroke();
     ctx.globalAlpha = 1.0;
@@ -311,9 +307,10 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     if (pts.length < 2) return false;
     var side = (state.map && state.map.driving_side) ? String(state.map.driving_side).toLowerCase() : 'right';
     var flip = side === 'left' ? -1 : 1;
-    var half = 3.5;
-    if (road.a) strokePoly(ctx, offsetPoly(pts, half * flip), colFor(road.a.density));
-    if (road.b) strokePoly(ctx, offsetPoly(pts, -half * flip), colFor(road.b.density));
+    var scale = Number(state && state._laneScale) || 1;
+    var half = 3.5 * scale;
+    if (road.a) strokePoly(ctx, offsetPoly(pts, half * flip), colFor(road.a.density), scale);
+    if (road.b) strokePoly(ctx, offsetPoly(pts, -half * flip), colFor(road.b.density), scale);
     return true;
   }
 
@@ -330,14 +327,30 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     var rx = -hy, ry = hx;
     var side = (state.map && state.map.driving_side) ? String(state.map.driving_side).toLowerCase() : 'right';
     if (side === 'left') { rx = -rx; ry = -ry; }
-    var half = Number(mark.gap_px || 7) * 0.5;
-    var lengthPx = Number(mark.length_px || 28);
+    var scale = Number(state && state._laneScale) || 1;
+    var half = Number(mark.gap_px || 7) * 0.5 * scale;
+    var lengthPx = Number(mark.length_px || 28) * scale;
     if (road.a) {
-      drawLane(ctx, origin[0] + rx * half, origin[1] + ry * half, hx, hy, lengthPx, colFor(road.a.density));
+      drawLane(ctx, origin[0] + rx * half, origin[1] + ry * half, hx, hy, lengthPx, colFor(road.a.density), scale);
     }
     if (road.b) {
-      drawLane(ctx, origin[0] - rx * half, origin[1] - ry * half, -hx, -hy, lengthPx, colFor(road.b.density));
+      drawLane(ctx, origin[0] - rx * half, origin[1] - ry * half, -hx, -hy, lengthPx, colFor(road.b.density), scale);
     }
+  }
+
+  function drawPortalMark(ctx, x, y, discovered) {
+    var s = 7;
+    ctx.beginPath();
+    ctx.moveTo(x, y - s);
+    ctx.lineTo(x + s * 0.72, y);
+    ctx.lineTo(x, y + s);
+    ctx.lineTo(x - s * 0.72, y);
+    ctx.closePath();
+    ctx.fillStyle = discovered ? '#e6c15a' : '#e85d4c';
+    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.lineWidth = 2;
+    ctx.fill();
+    ctx.stroke();
   }
 
   function drawIcon(ctx, img, x, y, size) {
@@ -377,6 +390,285 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     drawIcon(ctx, trafficImg, x, botY, size);
   }
 
+  var MERCATOR = 20037508.342789244;
+  var WMTS_PROVIDERS = [
+    {
+      id: 'geoland',
+      title: 'Geoland',
+      ext: 'png',
+      attribution: 'Datenquelle: basemap.at'
+    },
+    {
+      id: 'geoland-aerial',
+      title: 'Orthophoto',
+      ext: 'jpeg',
+      attribution: 'Datenquelle: basemap.at'
+    },
+    {
+      id: 'geoland-terrain',
+      title: 'Terrain',
+      ext: 'jpeg',
+      attribution: 'Datenquelle: basemap.at'
+    },
+    {
+      id: 'osm',
+      title: 'OSM',
+      ext: 'png',
+      attribution: '© OpenStreetMap contributors'
+    }
+  ];
+  var region = { key: '', gen: 0, canvas: null, bbox: null };
+  var frame = null;
+  var glance = null;
+
+  function providerById(id) {
+    for (var i = 0; i < WMTS_PROVIDERS.length; i++) {
+      if (WMTS_PROVIDERS[i].id === id) return WMTS_PROVIDERS[i];
+    }
+    return WMTS_PROVIDERS[0];
+  }
+
+  function mercatorToLonLat(x, y) {
+    var lon = x / MERCATOR * 180;
+    var lat = (2 * Math.atan(Math.exp((y / MERCATOR) * Math.PI)) - Math.PI / 2) * 180 / Math.PI;
+    return [lon, lat];
+  }
+
+  function lonLatToTile(lon, lat, z) {
+    var n = Math.pow(2, z);
+    lat = Math.max(-85.05112878, Math.min(85.05112878, lat));
+    var tx = Math.floor((lon + 180) / 360 * n);
+    var latRad = lat * Math.PI / 180;
+    var ty = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+    var n1 = n - 1;
+    return [Math.max(0, Math.min(n1, tx)), Math.max(0, Math.min(n1, ty))];
+  }
+
+  function tileWindow(bbox, z) {
+    var sw = mercatorToLonLat(bbox[0], bbox[1]);
+    var ne = mercatorToLonLat(bbox[2], bbox[3]);
+    var nw = lonLatToTile(sw[0], ne[1], z);
+    var se = lonLatToTile(ne[0], sw[1], z);
+    return { z: z, x0: Math.min(nw[0], se[0]), y0: Math.min(nw[1], se[1]), x1: Math.max(nw[0], se[0]), y1: Math.max(nw[1], se[1]) };
+  }
+
+  function chooseZoom(bbox) {
+    var best = 6;
+    // fetch_region_tiles.py writes z=10. A finer zoom has no files and the picture stays blank.
+    for (var z = 6; z <= 10; z++) {
+      var win = tileWindow(bbox, z);
+      var n = (win.x1 - win.x0 + 1) * (win.y1 - win.y0 + 1);
+      if (n <= 96) best = z;
+      else break;
+    }
+    return best;
+  }
+
+  function tileBounds(win) {
+    var n = Math.pow(2, win.z);
+    var tile = (2 * MERCATOR) / n;
+    var left = -MERCATOR + win.x0 * tile;
+    var top = MERCATOR - win.y0 * tile;
+    var right = -MERCATOR + (win.x1 + 1) * tile;
+    var bottom = MERCATOR - (win.y1 + 1) * tile;
+    return [left, bottom, right, top];
+  }
+
+  function regionExtent(state, zoomed) {
+    var content = contentBBox(state, zoomed);
+    var img = imageBBox(state, zoomed);
+    var box = content || img;
+    if (content && img) {
+      box = [
+        Math.min(content[0], img[0]),
+        Math.min(content[1], img[1]),
+        Math.max(content[2], img[2]),
+        Math.max(content[3], img[3])
+      ];
+    }
+    if (!box) return null;
+    var dx = Math.max(400, (box[2] - box[0]) * 0.04);
+    var dy = Math.max(400, (box[3] - box[1]) * 0.04);
+    return [box[0] - dx, box[1] - dy, box[2] + dx, box[3] + dy];
+  }
+
+  function extentKey(box) {
+    var out = [];
+    for (var i = 0; i < 4; i++) out.push(Math.round(box[i] / 100));
+    return out.join(',');
+  }
+
+  function asList(rows) {
+    if (!rows) return [];
+    if (Object.prototype.toString.call(rows) === '[object Array]') return rows;
+    if (typeof rows !== 'object') return [];
+    var keys = Object.keys(rows).filter(function (k) { return /^\d+$/.test(k); });
+    keys.sort(function (a, b) { return Number(a) - Number(b); });
+    var out = [];
+    for (var i = 0; i < keys.length; i++) out.push(rows[keys[i]]);
+    return out;
+  }
+
+  function requestRegion(scope, force) {
+    var st = scope.state;
+    if (!st || !st.map || st.map.crs !== 'EPSG:3857') return;
+    if (!window.bngApi || !bngApi.engineLua) return;
+    var extent = regionExtent(st, false);
+    if (!extent) return;
+    var view = st.view || {};
+    var provider = providerById(view.provider);
+    var rev = Number(view.redraw) || 0;
+    var key = provider.id + '|' + rev + '|' + extentKey(extent);
+    if (!force && region.key === key) return;
+    var win = tileWindow(extent, chooseZoom(extent));
+    var cols = win.x1 - win.x0 + 1;
+    var rows = win.y1 - win.y0 + 1;
+    if (cols < 1 || rows < 1 || cols * rows > 96) return;
+    region.key = key;
+    var gen = ++region.gen;
+    if (region.poll) {
+      clearInterval(region.poll);
+      region.poll = null;
+    }
+    var files = [];
+    var ext = provider.ext || 'png';
+    for (var ty = win.y0; ty <= win.y1; ty++) {
+      for (var tx = win.x0; tx <= win.x1; tx++) {
+        files.push({
+          x: tx,
+          y: ty,
+          ok: true,
+          path: '/ui/modules/apps/alpineRtTrafficMap/tilecache/' + provider.id + '/' + win.z + '/' + tx + '/' + ty + '.' + ext
+        });
+      }
+    }
+    paintTiles(scope, gen, {
+      files: files,
+      error: 'Region tiles are not in the mod. Run tools/fetch_region_tiles.py.'
+    }, win, provider, key, false, st);
+  }
+
+  function paintTiles(scope, gen, job, win, provider, key, zoomed, st) {
+    var files = asList(job && job.files);
+    var byPos = {};
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      if (f && f.ok && f.path) byPos[f.x + ',' + f.y] = String(f.path);
+    }
+    var ts = 256;
+    var cols = win.x1 - win.x0 + 1;
+    var rows = win.y1 - win.y0 + 1;
+    var off = document.createElement('canvas');
+    off.width = cols * ts;
+    off.height = rows * ts;
+    var ctx = off.getContext('2d');
+    ctx.fillStyle = '#d8d4cc';
+    ctx.fillRect(0, 0, off.width, off.height);
+    var pending = cols * rows;
+    var got = 0;
+    function finish() {
+      if (gen !== region.gen) return;
+      region.canvas = off;
+      region.bbox = tileBounds(win);
+      region.key = key;
+      scope.$evalAsync(function () {
+        scope.regionLabel = provider.attribution + (got ? (' · z' + win.z) : '');
+        scope.note = got ? '' : ((job && job.error) || 'Region map: no tiles loaded');
+        if (scope.redrawMap) scope.redrawMap();
+      });
+    }
+    function one() {
+      if (gen !== region.gen) return;
+      pending--;
+      if (pending <= 0) finish();
+    }
+    for (var ty = win.y0; ty <= win.y1; ty++) {
+      for (var tx = win.x0; tx <= win.x1; tx++) {
+        (function (tx, ty) {
+          var path = byPos[tx + ',' + ty];
+          if (!path) {
+            one();
+            return;
+          }
+          var img = new Image();
+          img.onload = function () {
+            if (gen !== region.gen) return;
+            ctx.drawImage(img, (tx - win.x0) * ts, (ty - win.y0) * ts, ts, ts);
+            got++;
+            one();
+          };
+          img.onerror = function () { one(); };
+          img.src = path;
+        })(tx, ty);
+      }
+    }
+  }
+
+  function isEditableRoad(road) {
+    return !!(road && (road.editable || road.user || String(road.id || '').indexOf('user:') === 0));
+  }
+
+  function roadKey(road) {
+    var ends = road && road.ends;
+    if (!ends || ends.length < 2 || !ends[0] || !ends[1]) return '';
+    return String(ends[0]) + '|' + String(ends[1]);
+  }
+
+  function routePts(road) {
+    var route = road && road.route;
+    var pts = [];
+    if (!route) return pts;
+    for (var i = 0; i < route.length; i++) {
+      var p = route[i];
+      if (p && p.length >= 2 && isFinite(Number(p[0])) && isFinite(Number(p[1]))) {
+        pts.push([Number(p[0]), Number(p[1])]);
+      }
+    }
+    return pts;
+  }
+
+  function drawDot(ctx, x, y, r, fill, stroke) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    if (stroke) {
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = stroke;
+      ctx.stroke();
+    }
+  }
+
+  function drawLineHandles(ctx, toXY, roads, selected) {
+    if (!roads) return;
+    ctx.save();
+    for (var r = 0; r < roads.length; r++) {
+      var road = roads[r];
+      if (!isEditableRoad(road)) continue;
+      var crs = routePts(road);
+      if (crs.length < 2) continue;
+      var active = !!selected && roadKey(road) === selected;
+      var pts = [];
+      for (var i = 0; i < crs.length; i++) pts.push(toXY(crs[i][0], crs[i][1]));
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (var k = 1; k < pts.length; k++) ctx.lineTo(pts[k][0], pts[k][1]);
+      ctx.setLineDash([5, 4]);
+      ctx.lineWidth = active ? 1.5 : 1;
+      ctx.strokeStyle = active ? 'rgba(255,255,255,0.9)' : 'rgba(255,176,64,0.75)';
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (!active) continue;
+      for (var s = 0; s < pts.length - 1; s++) {
+        drawDot(ctx, (pts[s][0] + pts[s + 1][0]) * 0.5, (pts[s][1] + pts[s + 1][1]) * 0.5, 5, '#ff6600', 'rgba(0,0,0,0.65)');
+      }
+      for (var v = 1; v < pts.length - 1; v++) {
+        drawDot(ctx, pts[v][0], pts[v][1], 6.5, '#f4f6f8', '#ff6600');
+      }
+    }
+    ctx.restore();
+  }
+
   function draw(canvas, state, onImgReady) {
     if (!canvas) return;
     var ctx = canvas.getContext('2d');
@@ -401,22 +693,29 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
 
     var zoomed = !!(state && state._zoomed);
     var rec = zoomed ? levelRec(state) : null;
-    var imgB = imageBBox(state, zoomed);
-    var view = viewBBox(state, w, h, zoomed);
+    var baked = region.canvas && region.bbox;
+    var imgB = baked ? region.bbox : imageBBox(state, zoomed);
+    var view = viewBBox(state, w, h, zoomed, baked ? region.bbox : null);
     if (!view) {
+      frame = null;
       ctx.fillStyle = 'rgba(255,255,255,0.55)';
       ctx.font = '12px system-ui, sans-serif';
       ctx.fillText('Map bounds invalid.', 12, 22);
       return;
     }
+    frame = { view: view.slice(), w: w, h: h };
 
     var spanX = view[2] - view[0];
     var spanY = view[3] - view[1];
-    var imgUrl = (rec && rec.image) ? String(rec.image) : (state.map && state.map.image ? String(state.map.image) : '');
-    var img = loadImg(imgUrl, onImgReady);
-    if (img && img.naturalWidth > 0 && img.naturalHeight > 0 && imgB) {
-      var iw = img.naturalWidth;
-      var ih = img.naturalHeight;
+    var webMerc = state && state.map && state.map.crs === 'EPSG:3857';
+    var img = baked ? region.canvas : null;
+    if (!img && !webMerc) {
+      var imgUrl = (rec && rec.image) ? String(rec.image) : (state.map && state.map.image ? String(state.map.image) : '');
+      img = loadImg(imgUrl, onImgReady);
+    }
+    var iw = img ? (img.naturalWidth || img.width) : 0;
+    var ih = img ? (img.naturalHeight || img.height) : 0;
+    if (img && iw > 0 && ih > 0 && imgB) {
       var sx = (view[0] - imgB[0]) / (imgB[2] - imgB[0]) * iw;
       var sy = (imgB[3] - view[3]) / (imgB[3] - imgB[1]) * ih;
       var sw = (view[2] - view[0]) / (imgB[2] - imgB[0]) * iw;
@@ -437,8 +736,19 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     ctx.lineWidth = 1;
     ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
 
+    state._laneScale = 1;
     for (var k = 0; k < roads.length; k++) {
       drawCarriageway(ctx, toXY, roads[k], state);
+    }
+    if (state && state._editLine) drawLineHandles(ctx, toXY, roads, state._editKey || '');
+    if (zoomed) {
+      var marks = (state && state.gate_marks) ? state.gate_marks : [];
+      for (var m = 0; m < marks.length; m++) {
+        var mk = marks[m];
+        if (!mk || !mk.crs || mk.crs.length < 2) continue;
+        var xy = toXY(Number(mk.crs[0]), Number(mk.crs[1]));
+        drawPortalMark(ctx, xy[0], xy[1], !!mk.discovered);
+      }
     }
     var nodes = (state && state.maps) ? state.maps : [];
     for (var n = 0; n < nodes.length; n++) {
@@ -455,112 +765,513 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     restrict: 'EA',
     scope: true,
     link: function (scope, element) {
-      scope.state = { level: null, roads: [], setup: { open_returns: [] } };
+      scope.state = { level: null, roads: [] };
       scope.zoomed = false;
-      scope.panel = null;
       scope.note = '';
-      scope.form = { name: '', lat: '', lon: '' };
-      scope.levelQuery = '';
-      scope.levels = [];
+      scope.regionLabel = '';
+      scope.collapsed = false;
+      scope.editLine = false;
+      scope.editKey = '';
+      scope.editLabel = '';
+      try { scope.collapsed = localStorage.getItem('alpineRtMapCollapsed') === '1'; } catch (e) {}
 
-      function luaQuote(s) {
-        return "'" + String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+      function appHost() {
+        var node = element[0];
+        while (node) {
+          if (node.classList && node.classList.contains('ui-app-host')) return node;
+          node = node.parentElement;
+        }
+        return null;
       }
 
-      function callLua(expr, done) {
-        if (!window.bngApi || !bngApi.engineLua) {
-          scope.note = 'Game link missing';
-          return;
-        }
-        bngApi.engineLua("pcall(extensions.load, 'alpinert')", function () {
-          bngApi.engineLua(expr, function (res) {
-            scope.$evalAsync(function () {
-              if (done) done(res);
-            });
+      function syncFrame() {
+        var host = appHost();
+        if (!host) return;
+        host.style.pointerEvents = scope.collapsed ? 'none' : '';
+      }
+
+      scope.toggleCollapse = function () {
+        scope.collapsed = !scope.collapsed;
+        try { localStorage.setItem('alpineRtMapCollapsed', scope.collapsed ? '1' : '0'); } catch (e) {}
+        syncFrame();
+        if (!scope.collapsed) {
+          requestAnimationFrame(function () {
+            redraw();
+            requestRegion(scope, false);
           });
-        });
-      }
-
-      scope.filteredLevels = function () {
-        var q = String(scope.levelQuery || '').toLowerCase();
-        var rows = scope.levels || [];
-        if (!q) return rows;
-        var out = [];
-        for (var i = 0; i < rows.length; i++) {
-          var r = rows[i];
-          var hay = ((r.title || '') + ' ' + (r.id || '')).toLowerCase();
-          if (hay.indexOf(q) >= 0) out.push(r);
-        }
-        return out;
-      };
-
-      scope.openDefine = function () {
-        scope.panel = scope.panel === 'define' ? null : 'define';
-        scope.note = '';
-        var s = scope.state && scope.state.setup;
-        if (s) {
-          if (s.name) scope.form.name = s.name;
-          if (s.lat != null) scope.form.lat = String(s.lat);
-          if (s.lon != null) scope.form.lon = String(s.lon);
         }
       };
-
-      scope.saveLocation = function (cardinal) {
-        var lat = Number(scope.form.lat);
-        var lon = Number(scope.form.lon);
-        if (String(scope.form.lat).trim() === '' || String(scope.form.lon).trim() === '' || !isFinite(lat) || !isFinite(lon)) {
-          scope.note = 'Latitude and longitude are required.';
-          return;
-        }
-        var expr = 'extensions.alpinert.defineLocation('
-          + luaQuote(scope.form.name) + ',' + lat + ',' + lon + ',' + luaQuote(cardinal) + ')';
-        callLua(expr, function (res) {
-          scope.note = (res && res.ok) ? ('Saved in ' + (res.authority || 'map CRS')) : ((res && res.error) || 'Could not save the map');
-          if (res && res.ok) scope.panel = null;
-          poll();
-        });
-      };
-
-      scope.openPortal = function () {
-        scope.panel = scope.panel === 'portal' ? null : 'portal';
-        scope.note = '';
-        if (scope.panel !== 'portal') return;
-        callLua('(extensions.alpinert and extensions.alpinert.listLevels()) or {}', function (rows) {
-          scope.levels = rows || [];
-          if (!scope.levels.length) scope.note = 'No other maps found';
-        });
-      };
-
-      scope.choosePortal = function (lv) {
-        if (!lv || !lv.id) return;
-        callLua('extensions.alpinert.placePortal(' + luaQuote(lv.id) + ')', function (res) {
-          scope.note = (res && res.ok) ? ('Portal to ' + (lv.title || lv.id)) : ((res && res.error) || 'Could not place the portal');
-          if (res && res.ok) scope.panel = null;
-          poll();
-        });
-      };
-
-      scope.openReturn = function () {
-        scope.panel = scope.panel === 'return' ? null : 'return';
-        scope.note = '';
-      };
-
-      scope.chooseReturn = function (link) {
-        if (!link || !link.id) return;
-        callLua('extensions.alpinert.placeReturn(' + luaQuote(link.id) + ')', function (res) {
-          scope.note = (res && res.ok) ? 'Return portal placed' : ((res && res.error) || 'Could not place the return portal');
-          if (res && res.ok) scope.panel = null;
-          poll();
-        });
-      };
+      requestAnimationFrame(syncFrame);
 
       function canvasEl() {
         return element[0] && element[0].querySelector ? element[0].querySelector('canvas') : null;
       }
 
+      var lineEdit = null;
+      var lineHeld = null;
+      var pan = null;
+
+      function panLimits() {
+        if (region.bbox) return region.bbox;
+        var st = scope.state;
+        return contentBBox(st, false) || imageBBox(st, false);
+      }
+
+      function zoomAbout(view, x, y, factor) {
+        var spanX = view[2] - view[0];
+        var spanY = view[3] - view[1];
+        var nextX = spanX * factor;
+        var nextY = spanY * factor;
+        if (nextX < 20000 || nextY < 20000) return view.slice();
+        var u = x / Math.max(1, frame.w);
+        var v = 1 - y / Math.max(1, frame.h);
+        var e = view[0] + u * spanX;
+        var n = view[1] + v * spanY;
+        return clampView([
+          e - u * nextX,
+          n - v * nextY,
+          e + (1 - u) * nextX,
+          n + (1 - v) * nextY
+        ], panLimits());
+      }
+
+      function startPan(ev) {
+        if (scope.zoomed || !frame || !frame.view) return;
+        var xy = localXY(ev);
+        pan = { pointerId: ev.pointerId, x: xy[0], y: xy[1], view: frame.view.slice() };
+        var c = canvasEl();
+        if (c) {
+          if (c.setPointerCapture) {
+            try { c.setPointerCapture(ev.pointerId); } catch (err) {}
+          }
+          c.classList.add('panning');
+        }
+      }
+
+      function movePan(ev) {
+        if (!pan || ev.pointerId !== pan.pointerId || !frame) return;
+        var xy = localXY(ev);
+        var spanX = pan.view[2] - pan.view[0];
+        var spanY = pan.view[3] - pan.view[1];
+        var east = -(xy[0] - pan.x) / Math.max(1, frame.w) * spanX;
+        var north = (xy[1] - pan.y) / Math.max(1, frame.h) * spanY;
+        glance = clampView([
+          pan.view[0] + east,
+          pan.view[1] + north,
+          pan.view[2] + east,
+          pan.view[3] + north
+        ], panLimits());
+        redraw();
+      }
+
+      function endPan(ev) {
+        if (!pan || (ev && ev.pointerId !== pan.pointerId)) return;
+        pan = null;
+        var c = canvasEl();
+        if (c) c.classList.remove('panning');
+      }
+
+      function onWheel(ev) {
+        if (scope.collapsed || scope.zoomed || !frame || !frame.view) return;
+        ev.preventDefault();
+        var xy = localXY(ev);
+        var factor = ev.deltaY > 0 ? 1.12 : (1 / 1.12);
+        glance = zoomAbout(frame.view, xy[0], xy[1], factor);
+        redraw();
+      }
+
+      function luaQuote(s) {
+        return "'" + String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+      }
+
+      function localXY(ev) {
+        var c = canvasEl();
+        if (!c) return [0, 0];
+        var rect = c.getBoundingClientRect();
+        return [ev.clientX - rect.left, ev.clientY - rect.top];
+      }
+
+      function frameToXY(e, n) {
+        var view = frame.view;
+        var spanX = view[2] - view[0];
+        var spanY = view[3] - view[1];
+        return [(e - view[0]) / spanX * frame.w, (1 - (n - view[1]) / spanY) * frame.h];
+      }
+
+      function frameToCrs(x, y) {
+        var view = frame.view;
+        var spanX = view[2] - view[0];
+        var spanY = view[3] - view[1];
+        return [
+          view[0] + (x / Math.max(1, frame.w)) * spanX,
+          view[1] + (1 - y / Math.max(1, frame.h)) * spanY
+        ];
+      }
+
+      function distPx(a, b) {
+        var dx = a[0] - b[0];
+        var dy = a[1] - b[1];
+        return Math.sqrt(dx * dx + dy * dy);
+      }
+
+      function userRoadList() {
+        var roads = (scope.state && scope.state.roads) || [];
+        var out = [];
+        for (var i = 0; i < roads.length; i++) {
+          if (isEditableRoad(roads[i]) && roadKey(roads[i])) out.push(roads[i]);
+        }
+        return out;
+      }
+
+      function roadByKey(key) {
+        if (!key) return null;
+        var roads = userRoadList();
+        for (var i = 0; i < roads.length; i++) {
+          if (roadKey(roads[i]) === key) return roads[i];
+        }
+        return null;
+      }
+
+      function levelTitle(id) {
+        var locs = asList(scope.state && scope.state.region && scope.state.region.locations);
+        for (var i = 0; i < locs.length; i++) {
+          if (locs[i] && locs[i].id === id && locs[i].name) return locs[i].name;
+        }
+        var maps = asList(scope.state && scope.state.maps);
+        for (var m = 0; m < maps.length; m++) {
+          var title = maps[m] && maps[m].id === id && maps[m].title;
+          if (title && String(title).indexOf('levels.') !== 0) return String(title);
+        }
+        var s = String(id || '').replace(/^autoroad_/, '').replace(/_\d+$/, '').replace(/_/g, ' ');
+        if (!s) return String(id || '');
+        return s.replace(/\b[a-z]/g, function (ch) { return ch.toUpperCase(); });
+      }
+
+      function routeLabel(key) {
+        if (!key) return '';
+        var cut = String(key).indexOf('|');
+        if (cut < 0) return String(key);
+        return levelTitle(key.slice(0, cut)) + ' – ' + levelTitle(key.slice(cut + 1));
+      }
+
+      function frameRoute(road) {
+        var pts = routePts(road);
+        if (pts.length < 2) return;
+        var minE = pts[0][0];
+        var maxE = minE;
+        var minN = pts[0][1];
+        var maxN = minN;
+        for (var i = 1; i < pts.length; i++) {
+          if (pts[i][0] < minE) minE = pts[i][0];
+          if (pts[i][0] > maxE) maxE = pts[i][0];
+          if (pts[i][1] < minN) minN = pts[i][1];
+          if (pts[i][1] > maxN) maxN = pts[i][1];
+        }
+        var padE = Math.max(4000, (maxE - minE) * 0.18);
+        var padN = Math.max(4000, (maxN - minN) * 0.18);
+        var box = [minE - padE, minN - padN, maxE + padE, maxN + padN];
+        var c = canvasEl();
+        var aspect = (c && c.clientWidth && c.clientHeight) ? (c.clientWidth / c.clientHeight) : 1;
+        box = expandToAspect(box, aspect, 1);
+        if ((box[2] - box[0]) < 20000) {
+          var cx = 0.5 * (box[0] + box[2]);
+          box[0] = cx - 10000;
+          box[2] = cx + 10000;
+        }
+        if ((box[3] - box[1]) < 20000) {
+          var cy = 0.5 * (box[1] + box[3]);
+          box[1] = cy - 10000;
+          box[3] = cy + 10000;
+        }
+        var limits = panLimits();
+        glance = clampView(box, limits || box);
+      }
+
+      function syncEditSelection(preferKey, frameIfNew) {
+        var prev = scope.editKey || '';
+        if (preferKey) scope.editKey = String(preferKey);
+        var roads = userRoadList();
+        if (!roadByKey(scope.editKey)) {
+          if (roads.length === 1 && !preferKey) scope.editKey = roadKey(roads[0]);
+          else if (roads.length > 0) scope.editKey = '';
+        }
+        scope.editLabel = scope.editLine ? routeLabel(scope.editKey) : '';
+        if (frameIfNew && !pan && !lineEdit && scope.editKey && scope.editKey !== prev) {
+          var picked = roadByKey(scope.editKey);
+          if (picked) frameRoute(picked);
+        }
+      }
+
+      function distToSeg(p, a, b) {
+        var dx = b[0] - a[0];
+        var dy = b[1] - a[1];
+        var len2 = dx * dx + dy * dy;
+        if (len2 < 1) return distPx(p, a);
+        var t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2;
+        if (t < 0) t = 0;
+        if (t > 1) t = 1;
+        return distPx(p, [a[0] + t * dx, a[1] + t * dy]);
+      }
+
+      function hitRoadLine(xy) {
+        var roads = userRoadList();
+        var best = null;
+        var bestD = 12;
+        for (var r = 0; r < roads.length; r++) {
+          var pts = routePts(roads[r]);
+          if (pts.length < 2 || !frame) continue;
+          var xyPts = [];
+          for (var i = 0; i < pts.length; i++) xyPts.push(frameToXY(pts[i][0], pts[i][1]));
+          for (var s = 0; s < xyPts.length - 1; s++) {
+            var d = distToSeg(xy, xyPts[s], xyPts[s + 1]);
+            if (d <= bestD) {
+              bestD = d;
+              best = roads[r];
+            }
+          }
+        }
+        return best;
+      }
+
+      function selectRoute(road) {
+        var key = roadKey(road);
+        if (!key) return;
+        scope.editKey = key;
+        scope.editLabel = routeLabel(key);
+        frameRoute(road);
+        publishRoutes(true);
+        scope.$evalAsync(redraw);
+      }
+
+      function normalizeRoads(state) {
+        if (!state) return;
+        var roads = asList(state.roads);
+        state.roads = roads;
+        for (var i = 0; i < roads.length; i++) {
+          var road = roads[i];
+          if (!road) continue;
+          var ends = asList(road.ends);
+          if (ends.length >= 2 && ends[0] && ends[1]) road.ends = [String(ends[0]), String(ends[1])];
+          var route = asList(road.route);
+          var pts = [];
+          for (var k = 0; k < route.length; k++) {
+            var row = asList(route[k]);
+            if (row.length >= 2 && isFinite(Number(row[0])) && isFinite(Number(row[1]))) {
+              pts.push([Number(row[0]), Number(row[1])]);
+            }
+          }
+          if (pts.length >= 2) road.route = pts;
+        }
+      }
+
+      function copyVia(via) {
+        var out = [];
+        for (var i = 0; i < via.length; i++) out.push([Number(via[i][0]), Number(via[i][1])]);
+        return out;
+      }
+
+      function viaOf(road) {
+        var pts = routePts(road);
+        var via = [];
+        for (var i = 1; i < pts.length - 1; i++) via.push(pts[i]);
+        return via;
+      }
+
+      function stampVia(road, via) {
+        var pts = routePts(road);
+        if (pts.length < 2) return;
+        var next = [pts[0]];
+        for (var i = 0; i < via.length; i++) next.push([Number(via[i][0]), Number(via[i][1])]);
+        next.push(pts[pts.length - 1]);
+        road.route = next;
+      }
+
+      function findRoad(key) {
+        var roads = (scope.state && scope.state.roads) || [];
+        for (var i = 0; i < roads.length; i++) {
+          if (roadKey(roads[i]) === key) return roads[i];
+        }
+        return null;
+      }
+
+      function restoreHeld() {
+        if (!lineHeld || !scope.state) return;
+        if (Date.now() > lineHeld.until) {
+          lineHeld = null;
+          return;
+        }
+        var road = findRoad(lineHeld.key);
+        if (!road) return;
+        var pts = routePts(road);
+        var same = pts.length === lineHeld.via.length + 2;
+        for (var i = 0; same && i < lineHeld.via.length; i++) {
+          if (Math.abs(pts[i + 1][0] - lineHeld.via[i][0]) > 1 || Math.abs(pts[i + 1][1] - lineHeld.via[i][1]) > 1) {
+            same = false;
+          }
+        }
+        if (same) {
+          lineHeld = null;
+          return;
+        }
+        stampVia(road, lineHeld.via);
+      }
+
+      function hitHandles(xy) {
+        var roads = (scope.state && scope.state.roads) || [];
+        var vertex = null;
+        var mid = null;
+        var bestV = 12;
+        var bestM = 14;
+        for (var r = 0; r < roads.length; r++) {
+          var road = roads[r];
+          if (!isEditableRoad(road) || roadKey(road) !== scope.editKey) continue;
+          var pts = routePts(road);
+          if (pts.length < 2) continue;
+          var xyPts = [];
+          for (var i = 0; i < pts.length; i++) xyPts.push(frameToXY(pts[i][0], pts[i][1]));
+          for (var v = 1; v < xyPts.length - 1; v++) {
+            var vd = distPx(xy, xyPts[v]);
+            if (vd <= bestV) {
+              bestV = vd;
+              vertex = { road: road, index: v - 1 };
+            }
+          }
+          for (var s = 0; s < xyPts.length - 1; s++) {
+            var at = [(xyPts[s][0] + xyPts[s + 1][0]) * 0.5, (xyPts[s][1] + xyPts[s + 1][1]) * 0.5];
+            var md = distPx(xy, at);
+            if (md <= bestM) {
+              bestM = md;
+              mid = { road: road, index: s };
+            }
+          }
+        }
+        return { vertex: vertex, mid: mid };
+      }
+
+      function saveVia(lo, hi, via) {
+        lineHeld = { key: String(lo) + '|' + String(hi), via: copyVia(via), until: Date.now() + 4000 };
+        if (!window.bngApi || !bngApi.engineLua) {
+          scope.note = 'Game link missing';
+          return;
+        }
+        var parts = [];
+        for (var i = 0; i < via.length; i++) {
+          var e = Number(via[i][0]);
+          var n = Number(via[i][1]);
+          if (!isFinite(e) || !isFinite(n)) continue;
+          parts.push('{' + e.toFixed(2) + ',' + n.toFixed(2) + '}');
+        }
+        var expr = '(extensions.alpinert and extensions.alpinert.setUserLink and extensions.alpinert.setUserLink('
+          + luaQuote(lo) + ',' + luaQuote(hi) + ',{' + parts.join(',') + '})) or {ok=false}';
+        bngApi.engineLua("pcall(extensions.load, 'alpinert')", function () {
+          bngApi.engineLua(expr, function (res) {
+            scope.$evalAsync(function () {
+              if (!res || res.ok !== true) {
+                scope.note = 'Line was not saved. Restart BeamNG once, then try again.';
+                lineHeld = null;
+              }
+            });
+          });
+        });
+      }
+
+      function beginDrag(road, index, via, ev) {
+        lineEdit = {
+          key: roadKey(road),
+          lo: String(road.ends[0]),
+          hi: String(road.ends[1]),
+          via: via,
+          index: index,
+          pointerId: ev.pointerId
+        };
+        var c = canvasEl();
+        if (c && c.setPointerCapture) {
+          try { c.setPointerCapture(ev.pointerId); } catch (err) {}
+        }
+        stampVia(road, via);
+        redraw();
+      }
+
+      function onPointerDown(ev) {
+        if (scope.collapsed || !frame) return;
+        if (scope.editLine) {
+          var xy = localXY(ev);
+          var hit = hitHandles(xy);
+          if (ev.button === 2) {
+            if (!hit.vertex) return;
+            ev.preventDefault();
+            var road = hit.vertex.road;
+            var via = viaOf(road);
+            via.splice(hit.vertex.index, 1);
+            stampVia(road, via);
+            saveVia(road.ends[0], road.ends[1], via);
+            redraw();
+            return;
+          }
+          if (ev.button !== 0) return;
+          if (hit.vertex) {
+            ev.preventDefault();
+            beginDrag(hit.vertex.road, hit.vertex.index, copyVia(viaOf(hit.vertex.road)), ev);
+            return;
+          }
+          if (hit.mid) {
+            var roadM = hit.mid.road;
+            var viaM = viaOf(roadM);
+            if (viaM.length >= 24) return;
+            var pts = routePts(roadM);
+            var seg = hit.mid.index;
+            viaM.splice(seg, 0, [
+              (pts[seg][0] + pts[seg + 1][0]) * 0.5,
+              (pts[seg][1] + pts[seg + 1][1]) * 0.5
+            ]);
+            ev.preventDefault();
+            beginDrag(roadM, seg, viaM, ev);
+            return;
+          }
+          var picked = hitRoadLine(xy);
+          if (picked && roadKey(picked) !== scope.editKey) {
+            ev.preventDefault();
+            selectRoute(picked);
+            return;
+          }
+        }
+        if (ev.button !== 0) return;
+        ev.preventDefault();
+        startPan(ev);
+      }
+
+      function onPointerMove(ev) {
+        if (lineEdit && ev.pointerId === lineEdit.pointerId && frame) {
+          var xy = localXY(ev);
+          lineEdit.via[lineEdit.index] = frameToCrs(xy[0], xy[1]);
+          var road = findRoad(lineEdit.key);
+          if (road) stampVia(road, lineEdit.via);
+          redraw();
+          return;
+        }
+        movePan(ev);
+      }
+
+      function onPointerUp(ev) {
+        if (lineEdit && ev.pointerId === lineEdit.pointerId) {
+          var done = lineEdit;
+          lineEdit = null;
+          saveVia(done.lo, done.hi, done.via);
+          return;
+        }
+        endPan(ev);
+      }
+
+      function onContext(ev) {
+        if (!scope.editLine) return;
+        ev.preventDefault();
+      }
+
       function redraw() {
         var st = scope.state || {};
         st._zoomed = !!scope.zoomed;
+        st._editLine = !!scope.editLine;
+        st._editKey = scope.editKey || '';
         draw(canvasEl(), st, redraw);
       }
 
@@ -568,14 +1279,72 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
         if (!d) return;
         scope.$evalAsync(function () {
           scope.state = d;
+          normalizeRoads(scope.state);
           scope.state._zoomed = !!scope.zoomed;
+          scope.state._editLine = !!scope.editLine;
+          if (scope.editLine) syncEditSelection('', true);
+          if (lineEdit) {
+            var road = findRoad(lineEdit.key);
+            if (road) stampVia(road, lineEdit.via);
+          } else {
+            restoreHeld();
+          }
           redraw();
+          requestRegion(scope, false);
         });
       }
 
+      scope.redrawMap = redraw;
+
+      function publishRoutes(on) {
+        try {
+          window.dispatchEvent(new CustomEvent('alpineRtRoutes', {
+            detail: { on: !!on, key: on ? (scope.editKey || '') : '' }
+          }));
+        } catch (e) {}
+      }
+
+      function applyEditRoutes(on, key) {
+        scope.editLine = !!on;
+        window.__alpineRtWantEditRoutes = false;
+        window.__alpineRtWantRoute = '';
+        if (!scope.editLine) {
+          scope.editKey = '';
+          scope.editLabel = '';
+        } else {
+          scope.zoomed = false;
+          if (scope.collapsed) {
+            scope.collapsed = false;
+            try { localStorage.setItem('alpineRtMapCollapsed', '0'); } catch (e) {}
+            syncFrame();
+          }
+          syncEditSelection(key || '', true);
+        }
+        publishRoutes(scope.editLine);
+        scope.$evalAsync(function () {
+          redraw();
+          if (scope.editLine) requestRegion(scope, false);
+        });
+      }
+
+      var mapBridge = {
+        setEditRoutes: function (on, key) {
+          scope.$evalAsync(function () { applyEditRoutes(on, key); });
+        },
+        isEditing: function () { return !!scope.editLine; }
+      };
+      window.__alpineRtMap = mapBridge;
+      if (window.__alpineRtWantEditRoutes) applyEditRoutes(true, window.__alpineRtWantRoute || '');
+
       scope.toggleZoom = function () {
         scope.zoomed = !scope.zoomed;
-        scope.$evalAsync(redraw);
+        if (scope.zoomed) {
+          if (scope.editLine) applyEditRoutes(false);
+          else scope.$evalAsync(redraw);
+        } else {
+          glance = null;
+          scope.$evalAsync(redraw);
+        }
       };
 
       function poll() {
@@ -603,6 +1372,16 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
       var timer = setInterval(poll, 1000);
       poll();
 
+      var lineCanvas = canvasEl();
+      if (lineCanvas) {
+        lineCanvas.addEventListener('pointerdown', onPointerDown);
+        lineCanvas.addEventListener('pointermove', onPointerMove);
+        lineCanvas.addEventListener('pointerup', onPointerUp);
+        lineCanvas.addEventListener('pointercancel', onPointerUp);
+        lineCanvas.addEventListener('contextmenu', onContext);
+        lineCanvas.addEventListener('wheel', onWheel, { passive: false });
+      }
+
       // Redraw on size changes (simple periodic check).
       var lastW = 0, lastH = 0;
       var sizeTimer = setInterval(function () {
@@ -617,6 +1396,19 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
       scope.$on('$destroy', function () {
         clearInterval(timer);
         clearInterval(sizeTimer);
+        if (window.__alpineRtMap === mapBridge) {
+          window.__alpineRtMap = null;
+          publishRoutes(false);
+        }
+        if (region.poll) clearInterval(region.poll);
+        if (lineCanvas) {
+          lineCanvas.removeEventListener('pointerdown', onPointerDown);
+          lineCanvas.removeEventListener('pointermove', onPointerMove);
+          lineCanvas.removeEventListener('pointerup', onPointerUp);
+          lineCanvas.removeEventListener('pointercancel', onPointerUp);
+          lineCanvas.removeEventListener('contextmenu', onContext);
+          lineCanvas.removeEventListener('wheel', onWheel);
+        }
       });
     }
   };

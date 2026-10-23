@@ -1,7 +1,11 @@
-# Alpine Roadtrip portal graph: Fernpass <-> Imst <-> Reschen.
-# Boxes sit at the midpoint of the named GIP OBJECTID. Arrival is 20 m
-# further toward that map's bbox center so the player does not re-enter.
-# Hahntennjoch is a later branch from Imst — not in this graph.
+# Alpine Roadtrip portal graph:
+#   Fernpass <-> Imst-Tarrenz <-> Reschen
+#                    |
+#              Timmelsjoch
+# Boxes sit at the midpoint of the named road OBJECTID (GIP on Tirol maps,
+# Südtirol LinksSequences on Timmelsjoch). Arrival is 20 m further toward
+# that map's bbox center so the player does not re-enter.
+# Hahntennjoch is a later branch from Imst-Tarrenz — not in this graph.
 
 # dwell_s in YAML is fallback. build_portals sets dwell_base_s = distance
 # between the two map bbox centres in km (15 km → 15 s). Lua then rolls
@@ -22,7 +26,8 @@ arc:
   samples: 56
 
 # UI-App overlay: georeferenced overview + weather/traffic icon stacks.
-# source: basemap_at (CC-BY 4.0). Later: swisstopo_landeskarte, osm, …
+# The overview authority is Web Mercator, the same CRS as the WMTS tiles.
+# In the app: Geoland (basemap.at, Tyrol), aerial, terrain, or OSM.
 # icons.size_px / stack_gap_px / offset_px are HUD pixels from the road mark
 # (offset x right, y down). Per road, the same keys under roads[].icons.
 # weather: sun|clouds|rain|snow (optional override). alert: true → Ausrufezeichen.
@@ -30,7 +35,7 @@ map:
   source: basemap_at
   # Authority for the overview and for maps added in-game.
   # Define map refuses to save when this is missing.
-  crs: EPSG:31254
+  crs: EPSG:3857
   image: /ui/modules/apps/alpineRtTrafficMap/basemap.png
   driving_side: right
   mark_length_px: 28
@@ -67,12 +72,27 @@ roads:
         - [47.191240, 10.753352]
         - [47.173403, 10.732076]
         - [47.141647, 10.707534]
+  - id: imst_timmelsjoch
+    a: imst_to_timmelsjoch
+    b: timmelsjoch_to_imst
+    label: Timmelsjoch
+    via_wgs84:
+      along: imst_to_timmelsjoch
+      points:
+        - [47.2005, 10.8970]   # Ötz / Sautens
+        - [47.1390, 10.9280]   # Umhausen
+        - [47.0720, 10.9690]   # Längenfeld
+        - [46.9685, 11.0075]   # Sölden
+        - [46.9120, 11.0520]   # Hochgurgl
 
+# discoverable: true on a gate — no arrival spawn, no overview route, and no
+# zoom symbol until the player has stood in the box for 1 s this session.
+# The wait stays on the light traffic band. Omit the key for a normal transit portal.
 gates:
   - id: fernpass_to_imst
     from_level: autoroad_fernpass_8192
-    to_level: autoroad_imst_8192
-    label: Richtung Imst
+    to_level: imst_tarrenz
+    label: To Imst-Tarrenz
     box:
       pos: [3000.598, 49.156, 109.246]   # B179 OID 2372 mid
       tangent: [0.8116, -0.5842]
@@ -82,9 +102,9 @@ gates:
       tangent: [-0.8552, -0.5183]
 
   - id: imst_to_fernpass
-    from_level: autoroad_imst_8192
+    from_level: imst_tarrenz
     to_level: autoroad_fernpass_8192
-    label: Richtung Fernpass
+    label: To Fernpass
     box:
       pos: [7917.217, 4885.691, 175.632]  # B189 OID 8630 mid
       tangent: [-0.8552, -0.5183]
@@ -94,9 +114,9 @@ gates:
       tangent: [-0.8116, 0.5842]
 
   - id: imst_to_reschen
-    from_level: autoroad_imst_8192
+    from_level: imst_tarrenz
     to_level: autoroad_reschen_8192
-    label: Richtung Reschen
+    label: To Reschen
     box:
       pos: [4266.270, 171.560, 170.576]   # B171 OID 4687 mid
       tangent: [-0.4421, -0.8970]
@@ -107,8 +127,8 @@ gates:
 
   - id: reschen_to_imst
     from_level: autoroad_reschen_8192
-    to_level: autoroad_imst_8192
-    label: Richtung Imst
+    to_level: imst_tarrenz
+    label: To Imst-Tarrenz
     box:
       pos: [981.270, 6377.518, 116.247]   # A12 ramp OID 235616 mid (not the tunnel)
       tangent: [-0.8943, 0.4476]
@@ -116,3 +136,27 @@ gates:
     arrive:
       pos: [4275.112, 189.499, 170.576]   # B171 OID 4687 + 20 m inward
       tangent: [0.4421, 0.8970]
+
+  - id: imst_to_timmelsjoch
+    from_level: imst_tarrenz
+    to_level: Timmelsjoch_2048
+    label: To Timmelsjoch
+    box:
+      pos: [4933.734, 8.586, 115.673]     # L61 OID 11904 mid (south edge → Ötztal)
+      tangent: [0.0, -1.0]
+      size: [12.0, 8.0, 6.0]
+    arrive:
+      pos: [1219.455, 1952.462, 629.458]  # L1 OID 816636 + 20 m inward
+      tangent: [0.6296, -0.7769]
+
+  - id: timmelsjoch_to_imst
+    from_level: Timmelsjoch_2048
+    to_level: imst_tarrenz
+    label: To Imst-Tarrenz
+    box:
+      pos: [1206.863, 1968.0, 629.458]    # L1 OID 816636 near north edge
+      tangent: [-0.6296, 0.7769]
+      size: [12.0, 8.0, 6.0]
+    arrive:
+      pos: [4933.734, 28.586, 115.673]    # L61 OID 11904 + 20 m inward
+      tangent: [0.0, 1.0]

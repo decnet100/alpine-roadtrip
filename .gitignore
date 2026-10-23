@@ -4,6 +4,7 @@ __pycache__/
 
 # basemap.at tile cache
 data/raw/
+mods/autoroad_alpine_rt/ui/modules/apps/alpineRtTrafficMap/tilecache/
 
 Thumbs.db
 .DS_Store
