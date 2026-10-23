@@ -169,7 +169,7 @@ No engine world streaming.
 
 - Real streaming / one mega heightmap of every pass
 - Official race UI across maps
-- Online leaderboards
+- Online leaderboards, other than the hillclimb board in [HILLCLIMB.md](HILLCLIMB.md)
 - Traffic, damage persistence
 
 Reference: level change via `core_levels.startLevel`; persistence via `jsonWriteFile` / `jsonReadFile` (not `settings` as a dumping ground).

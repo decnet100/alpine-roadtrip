@@ -7,7 +7,7 @@ To generate enough maps in the same region quickly, maps themselves are built by
 
 Internal id is `alpine_rt`. Mod folder: `mods/autoroad_alpine_rt`. Runtime session file (BeamNG user folder, not in git): `settings/alpine_rt/session.json`.
 
-Concept and gates: [docs/ALPINE_ROADTRIP.md](docs/ALPINE_ROADTRIP.md). In-game registration: [Adding maps in-game](docs/ALPINE_ROADTRIP.md#adding-maps-in-game).
+Concept and gates: [docs/ALPINE_ROADTRIP.md](docs/ALPINE_ROADTRIP.md). In-game registration: [Adding maps in-game](docs/ALPINE_ROADTRIP.md#adding-maps-in-game). Hillclimb design: [docs/HILLCLIMB.md](docs/HILLCLIMB.md).
 
 ## Layout
 
