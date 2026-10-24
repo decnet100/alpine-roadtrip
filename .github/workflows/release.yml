@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zip the mod
+        run: |
+          cd mods
+          zip -r "../AlpineRoadtrip-${GITHUB_REF_NAME}.zip" autoroad_alpine_rt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Alpine Roadtrip ${{ github.ref_name }}
+          prerelease: ${{ startsWith(github.ref_name, 'v0.0.') }}
+          files: AlpineRoadtrip-${{ github.ref_name }}.zip
+          generate_release_notes: true
