@@ -7,5 +7,5 @@
   "category": "Gameplay",
   "css": { "width": "440px", "height": "520px", "top": "60px", "left": "60px" },
   "interactive": "yes",
-  "version": "0.1.0"
+  "version": "0.0.1"
 }

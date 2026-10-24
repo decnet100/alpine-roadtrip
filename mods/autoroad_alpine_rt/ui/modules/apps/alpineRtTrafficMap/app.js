@@ -57,7 +57,7 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
     + '    </div>'
     + '  </div>'
     + '  <div class="artm-sub">'
-    + '    <span>Level <b>{{state.level || "-"}}</b></span>'
+    + '    <span>Level <b>{{currentLevel()}}</b></span>'
     + '    <span ng-if="state.lua_rev">Lua <b>{{state.lua_rev}}</b></span>'
     + '    <span ng-if="state.roads">Roads <b>{{state.roads.length}}</b></span>'
     + '    <span ng-if="editLine && editLabel">{{editLabel}}. Drag an orange midpoint. Right-click removes a point.</span>'
@@ -393,10 +393,10 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
   var MERCATOR = 20037508.342789244;
   var WMTS_PROVIDERS = [
     {
-      id: 'geoland',
-      title: 'Geoland',
+      id: 'local',
+      title: 'Local',
       ext: 'png',
-      attribution: 'Datenquelle: basemap.at'
+      attribution: 'Datenquelle: basemap.at · © swisstopo · © GeoBasis-DE / BKG · © Bayerische Vermessungsverwaltung · © IGM'
     },
     {
       id: 'geoland-aerial',
@@ -422,6 +422,7 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
   var glance = null;
 
   function providerById(id) {
+    if (id === 'geoland') id = 'local';
     for (var i = 0; i < WMTS_PROVIDERS.length; i++) {
       if (WMTS_PROVIDERS[i].id === id) return WMTS_PROVIDERS[i];
     }
@@ -933,19 +934,20 @@ angular.module('beamng.apps').directive('alpinerttrafficmap', [function () {
       }
 
       function levelTitle(id) {
-        var locs = asList(scope.state && scope.state.region && scope.state.region.locations);
-        for (var i = 0; i < locs.length; i++) {
-          if (locs[i] && locs[i].id === id && locs[i].name) return locs[i].name;
-        }
         var maps = asList(scope.state && scope.state.maps);
         for (var m = 0; m < maps.length; m++) {
           var title = maps[m] && maps[m].id === id && maps[m].title;
-          if (title && String(title).indexOf('levels.') !== 0) return String(title);
+          title = String(title || '');
+          if (title && title.indexOf('levels.') === -1 && title.indexOf('{{') === -1) return title;
         }
         var s = String(id || '').replace(/^autoroad_/, '').replace(/_\d+$/, '').replace(/_/g, ' ');
         if (!s) return String(id || '');
         return s.replace(/\b[a-z]/g, function (ch) { return ch.toUpperCase(); });
       }
+
+      scope.currentLevel = function () {
+        return levelTitle(scope.state && scope.state.level) || '-';
+      };
 
       function routeLabel(key) {
         if (!key) return '';

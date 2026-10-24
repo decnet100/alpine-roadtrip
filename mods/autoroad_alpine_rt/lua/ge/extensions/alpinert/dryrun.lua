@@ -10,7 +10,7 @@ local MISSION = "imst_tarrenz_one_bend_v1"
 local RACE_FILE = "gameplay/missions/imst_tarrenz/timeTrial/imst_tarrenz_one_bend_v1/race.race.json"
 local SIDE_FILE = "gameplay/missions/imst_tarrenz/timeTrial/imst_tarrenz_one_bend_v1/alpine_rt.json"
 local LIST_FILE = "/lua/ge/extensions/alpinert/dryrun_vehicles.json"
-local OUT_FILE = "settings/alpine_rt/dryrun/imst_tarrenz_one_bend_v1/etkc__kc6_360_M.json"
+local OUT_DIR = "settings/alpine_rt/dryrun/imst_tarrenz_one_bend_v1"
 
 local STEP_M = 4
 local TAIL_M = 16
@@ -19,6 +19,7 @@ local SAMPLE_S = 0.1
 local TIMEOUT_S = 90
 
 local run = nil
+local queue = {}
 
 local function hypot(x, y)
   return math.sqrt(x * x + y * y)
@@ -34,17 +35,29 @@ local function levelName()
   return nil
 end
 
-local function loadList()
+local function listRows()
   local data = jsonReadFile(LIST_FILE)
   if not data or type(data.vehicles) ~= "table" then
     return nil
   end
-  for _, row in ipairs(data.vehicles) do
-    if row.model == "etkc" and row.config == "kc6_360_M" then
+  return data.vehicles
+end
+
+local function findRow(model, config)
+  local rows = listRows()
+  if not rows then
+    return nil
+  end
+  for _, row in ipairs(rows) do
+    if row.model == model and row.config == config then
       return row
     end
   end
   return nil
+end
+
+local function outFile(model, config)
+  return OUT_DIR .. "/" .. model .. "__" .. config .. ".json"
 end
 
 local function playerStart(race)
@@ -158,10 +171,15 @@ local function parkPlayer(startPos, dirx, diry)
 end
 
 local function writeResult(reason)
-  if not run or run.phase == "done" then
+  if not run or run.phase == "done" or run.phase == "gap" then
     return
   end
-  run.phase = "done"
+  if queue[1] then
+    run.phase = "gap"
+    run.gap = 0
+  else
+    run.phase = "done"
+  end
   local sidecar = jsonReadFile(SIDE_FILE) or {}
   local ref = tonumber(sidecar.reference_length_m) or 0
   local payload = {
@@ -180,10 +198,10 @@ local function writeResult(reason)
     trace_hz = 10,
     trace = run.trace,
   }
-  local ok = jsonWriteFile(OUT_FILE, payload, true)
+  local ok = jsonWriteFile(run.outFile, payload, true)
   log("I", "alpine_rt", string.format(
-    "dryrun %s time_ms=%d gates=%d/%d length=%.1f ref=%.1f file=%s",
-    reason, payload.time_ms, run.gate, #run.gates, run.length, ref, ok and OUT_FILE or "write failed"
+    "dryrun %s %s %s time_ms=%d gates=%d/%d length=%.1f ref=%.1f file=%s",
+    run.model, run.config, reason, payload.time_ms, run.gate, #run.gates, run.length, ref, ok and run.outFile or "write failed"
   ))
   local veh = getObjectByID(run.vehId)
   if veh then
@@ -191,8 +209,8 @@ local function writeResult(reason)
   end
 end
 
-local function startOnce()
-  if run and run.phase ~= "done" then
+local function startVehicle(model, config)
+  if run and run.phase ~= "done" and run.phase ~= "gap" then
     log("W", "alpine_rt", "dryrun already running")
     return
   end
@@ -201,9 +219,9 @@ local function startOnce()
     log("E", "alpine_rt", "dryrun wants " .. LEVEL .. ", current level is " .. tostring(level))
     return
   end
-  local row = loadList()
+  local row = findRow(model, config)
   if not row then
-    log("E", "alpine_rt", "dryrun vehicle list has no etkc / kc6_360_M")
+    log("E", "alpine_rt", "dryrun vehicle list has no " .. tostring(model) .. " / " .. tostring(config))
     return
   end
   local race = jsonReadFile(RACE_FILE)
@@ -255,6 +273,7 @@ local function startOnce()
     prev = nil,
     model = row.model,
     config = row.config,
+    outFile = outFile(row.model, row.config),
     vehId = veh:getID(),
     gates = race.pathnodes,
     script = script,
@@ -267,8 +286,56 @@ local function startOnce()
   ))
 end
 
+local function startOnce()
+  queue = {}
+  startVehicle("etkc", "kc6_360_M")
+end
+
+local function startRest()
+  if run and run.phase ~= "done" and run.phase ~= "gap" then
+    log("W", "alpine_rt", "dryrun already running")
+    return
+  end
+  local rows = listRows()
+  if not rows then
+    log("E", "alpine_rt", "dryrun vehicle list missing")
+    return
+  end
+  queue = {}
+  for _, row in ipairs(rows) do
+    if not (row.model == "etkc" and row.config == "kc6_360_M") then
+      queue[#queue + 1] = row
+    end
+  end
+  local first = table.remove(queue, 1)
+  if not first then
+    log("W", "alpine_rt", "dryrun has no remaining vehicles")
+    return
+  end
+  log("I", "alpine_rt", "dryrun remaining " .. tostring(1 + #queue))
+  startVehicle(first.model, first.config)
+end
+
 local function onUpdate(dtReal, dtSim)
   if not run or run.phase == "done" or dtSim <= 0 then
+    return
+  end
+  if run.phase == "gap" then
+    run.gap = run.gap + dtSim
+    if run.gap < 1.5 then
+      return
+    end
+    local oldId = run.vehId
+    local row = table.remove(queue, 1)
+    local player = getPlayerVehicle(0)
+    local old = getObjectByID(oldId)
+    if old and (not player or old:getID() ~= player:getID()) then
+      old:delete()
+    end
+    run.phase = "done"
+    if row then
+      startVehicle(row.model, row.config)
+    end
     return
   end
   if run.phase == "spawn" then
@@ -357,10 +424,12 @@ local function onUpdate(dtReal, dtSim)
 end
 
 local function onExtensionLoaded()
-  log("I", "alpine_rt", "dryrun loaded; alpinert_dryrun.startOnce() drives one ETK manual lap")
+  log("I", "alpine_rt", "dryrun loaded; startOnce, startVehicle(model, config), startRest")
 end
 
 M.startOnce = startOnce
+M.startVehicle = startVehicle
+M.startRest = startRest
 M.onUpdate = onUpdate
 M.onExtensionLoaded = onExtensionLoaded
 

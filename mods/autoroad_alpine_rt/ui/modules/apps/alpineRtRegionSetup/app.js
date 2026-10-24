@@ -2,7 +2,7 @@
 // A region file is the user overlay (locations, gates, WMTS provider), not portals.json.
 angular.module('beamng.apps').directive('alpinertregionsetup', [function () {
   var PROVIDERS = [
-    { id: 'geoland', title: 'Geoland' },
+    { id: 'local', title: 'Local' },
     { id: 'geoland-aerial', title: 'Orthophoto' },
     { id: 'geoland-terrain', title: 'Geoland terrain' },
     { id: 'osm', title: 'OSM' }
@@ -46,7 +46,7 @@ angular.module('beamng.apps').directive('alpinertregionsetup', [function () {
     + '  <div class="arts-head"><span class="arts-slash"></span><span class="arts-title" style="flex:1">REGION SETUP</span>'
     + '    <button type="button" class="arts-btn" ng-click="toggleCollapse()">{{collapsed ? "Show" : "Hide"}}</button></div>'
     + '  <div class="arts-body">'
-    + '    <div class="arts-sub">Level <b>{{state.level || "-"}}</b>'
+    + '    <div class="arts-sub">Level <b>{{currentLevel()}}</b>'
     + '      <span ng-if="state.setup && state.setup.authority"> · {{state.setup.authority}}</span>'
     + '      <span ng-if="state.lua_rev"> · Lua {{state.lua_rev}}</span></div>'
     + '    <div class="arts-q" ng-if="state.setup && state.setup.defined">This level already has a center. Saving replaces that center.</div>'
@@ -66,15 +66,14 @@ angular.module('beamng.apps').directive('alpinertregionsetup', [function () {
     + '    <h3 ng-if="gateRows().length">Portals</h3>'
     + '    <div class="arts-list" ng-if="gateRows().length">'
     + '      <div class="arts-row" ng-repeat="g in gateRows()">'
-    + '        <button type="button" class="arts-item" style="flex:1" disabled>{{g.label || g.id}}<small>{{g.from_level}} → {{g.to_level}}{{g.linked ? "" : " · one way"}}</small></button>'
+    + '        <button type="button" class="arts-item" style="flex:1" disabled>{{gateText(g)}}<small ng-if="!g.linked">one way</small></button>'
     + '        <button type="button" class="arts-btn" ng-if="g.here" ng-click="moveGate(g)">Move here</button>'
     + '        <button type="button" class="arts-btn" ng-if="!g.builtin" ng-click="removeGate(g)">Remove</button>'
     + '      </div>'
     + '    </div>'
     + '    <div ng-if="panel===\'place\'">'
     + '      <div class="arts-note" ng-if="state.lua_rev && !(state.setup && state.setup.authority)">No map CRS is configured.</div>'
-    + '      <input ng-model="form.name" placeholder="Location name">'
-    + '      <input ng-model="form.lat" placeholder="Latitude (WGS84)" style="margin-top:6px">'
+    + '      <input ng-model="form.lat" placeholder="Latitude (WGS84)">'
     + '      <input ng-model="form.lon" placeholder="Longitude (WGS84)" style="margin-top:6px">'
     + '      <div class="arts-q" style="margin-top:6px">In which direction is your vehicle currently pointing?</div>'
     + '      <div class="arts-tools">'
@@ -87,26 +86,26 @@ angular.module('beamng.apps').directive('alpinertregionsetup', [function () {
     + '    <div ng-if="panel===\'portal\'">'
     + '      <input ng-model="levelQuery" placeholder="Filter maps">'
     + '      <div class="arts-list" style="margin-top:6px">'
-    + '        <button type="button" class="arts-item" ng-repeat="lv in filteredLevels()" ng-click="choosePortal(lv)">{{lv.title}}<small>{{lv.id}}</small></button>'
+    + '        <button type="button" class="arts-item" ng-repeat="lv in filteredLevels()" ng-click="choosePortal(lv)">{{mapTitle(lv)}}</button>'
     + '      </div>'
     + '    </div>'
     + '    <div ng-if="panel===\'return\'">'
     + '      <div class="arts-q">Place the return portal at the vehicle.</div>'
     + '      <div class="arts-list">'
-    + '        <button type="button" class="arts-item" ng-repeat="link in state.setup.open_returns" ng-click="chooseReturn(link)">From {{link.label}}<small>{{link.from_level}}</small></button>'
+    + '        <button type="button" class="arts-item" ng-repeat="link in state.setup.open_returns" ng-click="chooseReturn(link)">From {{mapTitle(link)}}</button>'
     + '      </div>'
     + '    </div>'
     + '    <h3 ng-if="locationRows().length">Placed maps</h3>'
     + '    <div class="arts-list" ng-if="locationRows().length">'
     + '      <div class="arts-row" ng-repeat="loc in locationRows()">'
-    + '        <button type="button" class="arts-item" style="flex:1" disabled>{{loc.name}}<small>{{loc.id}}</small></button>'
+    + '        <button type="button" class="arts-item" style="flex:1" disabled>{{mapTitle(loc)}}</button>'
     + '        <button type="button" class="arts-btn" ng-click="removeLoc(loc)">Remove</button>'
     + '      </div>'
     + '    </div>'
     + '    <h3>Region picture</h3>'
-    + '    <div class="arts-q">Geoland is the road map. Orthophoto is the aerial photo.</div>'
+    + '    <div class="arts-q">Local is the road map. Orthophoto is the aerial photo.</div>'
     + '    <div class="arts-tools">'
-    + '      <button type="button" class="arts-btn" ng-repeat="p in providers" ng-class="{on: (state.view && state.view.provider) === p.id}" ng-click="pickProvider(p)">{{p.title}}</button>'
+    + '      <button type="button" class="arts-btn" ng-repeat="p in providers" ng-class="{on: (state.view && (state.view.provider === \'geoland\' ? \'local\' : state.view.provider)) === p.id}" ng-click="pickProvider(p)">{{p.title}}</button>'
     + '    </div>'
     + '    <button type="button" class="arts-btn" ng-click="redraw()">Redraw region map</button>'
     + '    <h3>Region file</h3>'
@@ -201,7 +200,6 @@ angular.module('beamng.apps').directive('alpinertregionsetup', [function () {
                 if (!d) return;
                 scope.state = d;
                 if (!scope.formReady && d.setup) {
-                  if (d.setup.name) scope.form.name = d.setup.name;
                   if (d.setup.lat != null) scope.form.lat = String(d.setup.lat);
                   if (d.setup.lon != null) scope.form.lon = String(d.setup.lon);
                   scope.formReady = true;
@@ -246,20 +244,40 @@ angular.module('beamng.apps').directive('alpinertregionsetup', [function () {
       }
       window.addEventListener('alpineRtRoutes', onRoutes);
 
+      function plainTitle(text) {
+        var s = String(text || '');
+        if (!s || s.indexOf('levels.') !== -1 || s.indexOf('{{') !== -1) return '';
+        return s;
+      }
+
       function levelTitle(id) {
-        var rows = scope.locationRows();
-        for (var i = 0; i < rows.length; i++) {
-          if (rows[i] && rows[i].id === id && rows[i].name) return rows[i].name;
-        }
         var maps = asList(scope.state && scope.state.maps);
         for (var m = 0; m < maps.length; m++) {
           var title = maps[m] && maps[m].id === id && maps[m].title;
-          if (title && String(title).indexOf('levels.') !== 0) return String(title);
+          title = plainTitle(title);
+          if (title) return title;
         }
         var s = String(id || '').replace(/^autoroad_/, '').replace(/_\d+$/, '').replace(/_/g, ' ');
         if (!s) return String(id || '');
         return s.replace(/\b[a-z]/g, function (ch) { return ch.toUpperCase(); });
       }
+
+      scope.currentLevel = function () {
+        return levelTitle(scope.state && scope.state.level) || '-';
+      };
+
+      scope.mapTitle = function (row) {
+        if (!row) return '';
+        var given = plainTitle(row.title);
+        if (given) return given;
+        return levelTitle(row.id || row.to_level || row.from_level);
+      };
+
+      scope.gateText = function (g) {
+        var label = plainTitle(g && g.label);
+        if (label) return label;
+        return 'To ' + levelTitle(g && g.to_level);
+      };
 
       scope.routeRows = function () {
         var roads = asList(scope.state && scope.state.roads);
@@ -355,7 +373,7 @@ angular.module('beamng.apps').directive('alpinertregionsetup', [function () {
           return;
         }
         callLua('extensions.alpinert.defineLocation('
-          + luaQuote(scope.form.name) + ',' + lat + ',' + lon + ',' + luaQuote(cardinal) + ')', function (res) {
+          + luaQuote('') + ',' + lat + ',' + lon + ',' + luaQuote(cardinal) + ')', function (res) {
           scope.note = (res && res.ok) ? ('Placed in ' + (res.authority || 'map CRS')) : ((res && res.error) || 'Could not place the map');
           if (res && res.ok) scope.panel = null;
           poll();

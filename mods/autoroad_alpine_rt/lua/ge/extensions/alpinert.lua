@@ -9,7 +9,7 @@ local GRAPH_PATH = "settings/alpine_rt/graph.json"
 local REGION_DIR = "settings/alpine_rt/regions"
 local PORTALS_PATH = "/lua/ge/extensions/alpinert/portals.json"
 -- Bump this when Lua changes; shown on load so a stale in-memory copy is obvious.
-local LUA_REV = "2026-10-24b"
+local LUA_REV = "2026-10-24s"
 -- Label used only when no TimeOfDay exists yet. 3600 s is 24× (one real hour, one game day).
 -- 0.40's live cycle is time / play / dayLength. Do not force this over Freeroam or a level.
 local DAY_LENGTH_S = 3600
@@ -44,7 +44,7 @@ local trafficWait = 0
 -- Temporary test. Kauns is the Reschen level. Densities also drive the map colours and the portal wait.
 local TEST_TRAFFIC = {
   -- cars = pool. active = how many of those run physics at once (BeamNG slider tops out at 15).
-  autoroad_fernpass_8192 = { dens = 0.90, cars = 100, active = 15 },
+  autoroad_fernpass_8192 = { dens = 0.90, cars = 15, active = 15 },
   imst_tarrenz = { dens = 0.22, cars = 3 },
   autoroad_reschen_8192 = { dens = 0.55, cars = 8 },
 }
@@ -348,41 +348,68 @@ local function reloadPortals()
   dwellGate = nil
 end
 
-local titleCache = {}
+local titles = { cache = {} }
 
 local function levelTitle(id)
   id = tostring(id or "")
   if id == "" then
     return ""
   end
-  if titleCache[id] then
-    return titleCache[id]
+  if titles.cache[id] then
+    return titles.cache[id]
   end
-  local function translated(key)
-    if type(key) ~= "string" or key == "" or not core_locales or not core_locales.translate then
-      return nil
+  local function usable(text)
+    return type(text) == "string" and text ~= "" and not text:find("levels%.", 1, true) and not text:find("{{", 1, true)
+  end
+  local function remember(text)
+    titles.cache[id] = text
+    return text
+  end
+  local function fromPacks(key)
+    if not titles.packs then
+      local loaded = {}
+      local lang = "en-US"
+      if core_locales and core_locales.getLanguage then
+        local ok, value = pcall(core_locales.getLanguage)
+        if ok and type(value) == "string" and value ~= "" then
+          lang = value
+        end
+      end
+      local function load(code)
+        local data = jsonReadFile("/locales/translations/" .. code .. "/main.translation.json")
+        if type(data) == "table" then
+          loaded[#loaded + 1] = data
+        end
+      end
+      load(lang)
+      if lang ~= "en-US" then
+        load("en-US")
+      end
+      if loaded[1] then
+        titles.packs = loaded
+      end
     end
-    local text = core_locales.translate(key, "")
-    if type(text) == "string" and text ~= "" and text ~= key then
-      return text
+    for _, data in ipairs(titles.packs or {}) do
+      if usable(data[key]) then
+        return data[key]
+      end
     end
     return nil
   end
-  local function remember(text)
-    titleCache[id] = text
-    return text
-  end
   local info = jsonReadFile("/levels/" .. id .. "/info.json")
   local raw = type(info) == "table" and type(info.title) == "string" and info.title or ""
-  local fromRaw = translated(raw)
-  if fromRaw then
-    return remember(fromRaw)
+  local key = (raw:find("^levels%.", 1) and raw) or ("levels." .. id .. ".info.title")
+  local fromFile = fromPacks(key)
+  if fromFile then
+    return remember(fromFile)
   end
-  local fromKey = translated("levels." .. id .. ".info.title")
-  if fromKey then
-    return remember(fromKey)
+  if core_locales and core_locales.translate then
+    local text = core_locales.translate(key)
+    if usable(text) and text ~= key then
+      return remember(text)
+    end
   end
-  if raw ~= "" and not raw:find("^levels%.", 1) and not raw:find("{{", 1, true) then
+  if usable(raw) then
     return remember(raw)
   end
   local short = id:gsub("^autoroad_", ""):gsub("_%d+$", ""):gsub("_", " ")
@@ -455,9 +482,7 @@ local function publishLocation(levelId, loc)
   if loc and type(loc.crs) == "table" and loc.crs[1] and loc.crs[2] then
     rec.crs = { loc.crs[1], loc.crs[2] }
   end
-  if loc and loc.name then
-    rec.title = loc.name
-  end
+  rec.title = levelTitle(levelId)
   portals.map.levels[levelId] = rec
 end
 
@@ -925,14 +950,105 @@ end
 local arcHomePos = {}
 
 local function placeMovedBoxes(level)
+  if type(level) ~= "string" or level == "" or level:find("/", 1, true) or level:find("\\", 1, true) then
+    level = currentLevel()
+  end
+  if not level and getMissionFilename then
+    local raw = tostring(getMissionFilename()):gsub("\\", "/")
+    level = canonicalLevel(raw:match("levels/([^/]+)/"))
+  end
   if not level or not scenetree or not scenetree.findObject then
     return
+  end
+  if not arcHomePos.asphaltNear then
+    arcHomePos.asphaltNear = function(gateBox)
+      local bx, by, bz = gateBox.pos[1], gateBox.pos[2], gateBox.pos[3]
+      local bestSq, rx, ry, rz, rdx, rdy
+      if not scenetree.findClassObjects then
+        return nil
+      end
+      for _, name in ipairs(scenetree.findClassObjects("DecalRoad")) do
+        if type(name) == "string" and name:sub(1, 6) == "decal_" then
+          local road = scenetree.findObject(name)
+          local drive = road and tonumber(road.drivability) or 0
+          if road and drive > 0 and road.getNodeCount and road.getNodePosition then
+            local count = road:getNodeCount()
+            local prev = nil
+            for i = 0, count - 1 do
+              local p = vec3(road:getNodePosition(i))
+              if prev then
+                local vx, vy = p.x - prev.x, p.y - prev.y
+                local len2 = vx * vx + vy * vy
+                local t = 0
+                if len2 > 1e-4 then
+                  t = ((bx - prev.x) * vx + (by - prev.y) * vy) / len2
+                  if t < 0 then
+                    t = 0
+                  elseif t > 1 then
+                    t = 1
+                  end
+                end
+                local x = prev.x + vx * t
+                local y = prev.y + vy * t
+                local z = prev.z + (p.z - prev.z) * t
+                local ddx, ddy, ddz = x - bx, y - by, z - bz
+                local sq = ddx * ddx + ddy * ddy + ddz * ddz
+                if sq < 60 * 60 and (not bestSq or sq < bestSq) then
+                  bestSq, rx, ry, rz, rdx, rdy = sq, x, y, z, vx, vy
+                end
+              end
+              prev = p
+            end
+          end
+        end
+      end
+      if not bestSq then
+        return nil
+      end
+      local fx, fy = rdx, rdy
+      local nlen = math.sqrt(fx * fx + fy * fy)
+      if nlen < 1e-4 then
+        fx, fy = 0, 1
+      else
+        fx, fy = fx / nlen, fy / nlen
+      end
+      if fx * (rx - bx) + fy * (ry - by) < 0 then
+        fx, fy = -fx, -fy
+      end
+      if pointInBox(rx, ry, rz, gateBox) then
+        local half = gateBox.size and gateBox.size[1] and gateBox.size[1] * 0.5 or 6
+        local step = half + 4
+        local ax, ay = rx + fx * step, ry + fy * step
+        if pointInBox(ax, ay, rz, gateBox) then
+          rx, ry = rx - fx * step, ry - fy * step
+          fx, fy = -fx, -fy
+        else
+          rx, ry = ax, ay
+        end
+      end
+      log("I", "alpine_rt", string.format(
+        "Arrive on asphalt %.1f %.1f %.1f, %.0f m from the gate",
+        rx, ry, rz, math.sqrt(bestSq)))
+      -- teleportToArrive and the level spawn both turn this heading 180°.
+      return { pos = { rx, ry, rz }, tangent = { -fx, -fy } }
+    end
+  end
+  local function poseAt(obj, pos, tangent)
+    local tx, ty = norm2(tangent and tangent[1] or 1, tangent and tangent[2] or 0)
+    local mat = MatrixF(true)
+    mat:setColumn(0, vec3(tx, ty, 0))
+    mat:setColumn(1, vec3(-ty, tx, 0))
+    mat:setColumn(2, vec3(0, 0, 1))
+    mat:setColumn(3, vec3(pos[1], pos[2], pos[3]))
+    obj:setTransform(mat)
   end
   for _, g in ipairs(portals.gates or {}) do
     if g.moved and canonicalLevel(g.from_level) == level and g.box and g.box.pos then
       local obj = scenetree.findObject("alpine_rt_box_" .. tostring(g.id))
       if obj then
         pcall(orientUserBox, obj, g)
+        obj.isRenderEnabled = true
+        obj.hidden = false
       end
       local delta = g.moveDelta
       local arc = delta and scenetree.findObject("alpine_rt_arc_" .. tostring(g.id))
@@ -944,6 +1060,66 @@ local function placeMovedBoxes(level)
           arcHomePos[g.id] = home
         end
         arc:setPosition(vec3(home[1] + delta[1], home[2] + delta[2], home[3] + delta[3]))
+      end
+    end
+  end
+  -- Once per load, before BeamNG spawns the player: the baked SpawnSphere is still
+  -- the old arrival. Move it onto the live gate so the level spawn and the later
+  -- reapply are the same place.
+  if arcHomePos.arriveLevel ~= level then
+    arcHomePos.arriveLevel = level
+    for _, g in ipairs(portals.gates or {}) do
+      if g.arrive and type(g.arrive.pos) == "table" and canonicalLevel(g.to_level) == level then
+        local sphere = scenetree.findObject("alpine_rt_arrive_" .. tostring(g.id))
+        local home = nil
+        if sphere then
+          for _, other in ipairs(portals.gates or {}) do
+            if other.box and other.box.pos
+              and canonicalLevel(other.from_level) == level
+              and canonicalLevel(other.to_level) == canonicalLevel(g.from_level) then
+              home = other
+              break
+            end
+          end
+        end
+        local pose = nil
+        if home then
+          local okPose, got = pcall(arcHomePos.asphaltNear, home.box)
+          if okPose then
+            pose = got
+          end
+        end
+        if sphere and not pose then
+          pose = { pos = g.arrive.pos, tangent = g.arrive.tangent }
+        end
+        if sphere and pose and pose.pos then
+          pose = {
+            pos = { pose.pos[1], pose.pos[2], (pose.pos[3] or 0) + 0.3 },
+            tangent = pose.tangent,
+          }
+          local p = sphere:getPosition()
+          local dx = p.x - pose.pos[1]
+          local dy = p.y - pose.pos[2]
+          local dz = p.z - (pose.pos[3] or p.z)
+          if dx * dx + dy * dy + dz * dz > 1 then
+            pcall(poseAt, sphere, pose.pos, pose.tangent)
+            log("I", "alpine_rt", string.format(
+              "Arrival marker %s -> %.1f %.1f %.1f",
+              tostring(g.id), pose.pos[1], pose.pos[2], pose.pos[3] or 0))
+          end
+          local session = readSession()
+          local pending = session and session.pending_restore
+          if pending and pending.from_gate == g.id and canonicalLevel(pending.to_level) == level
+            and setSpawnpoint and setSpawnpoint.setDefaultSP then
+            local marker = "alpine_rt_arrive_" .. tostring(g.id)
+            local prev = setSpawnpoint.loadDefaultSpawnpoint and setSpawnpoint.loadDefaultSpawnpoint(level) or nil
+            if prev ~= marker then
+              arcHomePos.restoreSpawn = { level = level, name = prev }
+              setSpawnpoint.setDefaultSP(marker, level)
+              log("I", "alpine_rt", "This crossing spawns at " .. marker)
+            end
+          end
+        end
       end
     end
   end
@@ -1063,8 +1239,11 @@ local function defineLocation(name, lat, lon, cardinal)
     return fail("No map CRS authority is configured. This map was not added.")
   end
   name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if name == "" or name:find("levels%.", 1, true) then
+    name = levelTitle(level)
+  end
   if name == "" then
-    return fail("Location name is required.")
+    name = level
   end
   if #name > 48 then
     name = name:sub(1, 48)
@@ -1211,7 +1390,7 @@ local function listLevels()
       return
     end
     seen[id] = true
-    if type(title) ~= "string" or title == "" or title:find("^levels%.", 1) or title:find("{{", 1, true) then
+    if type(title) ~= "string" or title == "" or title:find("levels%.", 1, true) or title:find("{{", 1, true) then
       title = nil
     end
     out[#out + 1] = { id = id, title = title or levelTitle(id) }
@@ -1266,6 +1445,7 @@ local function listLevels()
 end
 
 local PROVIDERS = {
+  ["local"] = true,
   geoland = true,
   ["geoland-aerial"] = true,
   ["geoland-terrain"] = true,
@@ -1293,7 +1473,7 @@ local function regionDocument(graph)
     version = 1,
     authority = mapAuthority(),
     view = {
-      provider = type(view.provider) == "string" and view.provider or "geoland",
+      provider = (view.provider == "geoland" or type(view.provider) ~= "string" or not PROVIDERS[view.provider]) and "local" or view.provider,
       redraw = tonumber(view.redraw) or 0,
     },
     locations = graph.locations,
@@ -1310,7 +1490,7 @@ local function regionCatalog(graph)
       local w = loc.wgs84
       locs[#locs + 1] = {
         id = tostring(id),
-        name = loc.name or tostring(id),
+        name = levelTitle(id),
         lat = type(w) == "table" and w[1] or nil,
         lon = type(w) == "table" and w[2] or nil,
       }
@@ -1331,7 +1511,7 @@ local function regionCatalog(graph)
       id = g.id,
       from_level = g.from_level,
       to_level = g.to_level,
-      label = (type(g.label) == "string" and g.label ~= "" and not g.label:find("levels%.", 1, true)) and g.label or ("To " .. levelTitle(g.to_level)),
+      label = (g.user ~= true and type(g.label) == "string" and g.label ~= "" and not g.label:find("levels%.", 1, true) and not g.label:find("{{", 1, true)) and g.label or ("To " .. levelTitle(g.to_level)),
       linked = type(g.arrive) == "table",
       builtin = g.user ~= true,
       here = canonicalLevel(g.from_level) == here,
@@ -1351,8 +1531,11 @@ end
 local function regionView(graph)
   local view = graph.view or {}
   local provider = view.provider
+  if provider == "geoland" then
+    provider = "local"
+  end
   if type(provider) ~= "string" or not PROVIDERS[provider] then
-    provider = "geoland"
+    provider = "local"
   end
   return { provider = provider, redraw = tonumber(view.redraw) or 0 }
 end
@@ -1431,6 +1614,9 @@ end
 
 local function setRegionProvider(id)
   id = tostring(id or "")
+  if id == "geoland" then
+    id = "local"
+  end
   if not PROVIDERS[id] then
     return fail("Unknown map provider.")
   end
@@ -1575,6 +1761,9 @@ end
 
 local function fetchRegionTiles(provider, z, x0, y0, x1, y1)
   provider = tostring(provider or "")
+  if provider == "local" then
+    return fail("Local tiles are fetched by tools/fetch_region_tiles.py.")
+  end
   local spec = TILE_SOURCES[provider]
   if not spec or not PROVIDERS[provider] then
     return fail("Unknown map provider.")
@@ -1724,6 +1913,7 @@ local function moveUserGate(id)
   end
   writeGraph(graph)
   reloadPortals()
+  arcHomePos.arriveLevel = nil
   pcall(placeMovedBoxes, level)
   uiMsg("Portal moved", 3)
   return { ok = true, id = id }
@@ -1958,6 +2148,140 @@ local function snapshotVehicle()
   return { model = model, config = config }
 end
 
+-- Coupled trailers are other vehicles. Node ids are the coupler cids from this config.
+carry.snapshotTrailers = function(playerId)
+  if not playerId or not core_vehicles or type(core_vehicles.attachedCouplers) ~= "table" then
+    return nil
+  end
+  local tags = core_vehicles.vehsCouplerTags or {}
+  local out = {}
+  local seen = {}
+  local function hitchOf(idA, nodeA, idB, nodeB)
+    if tags[idA] and tags[idA][nodeA] then
+      return idA, nodeA, idB, nodeB, tags[idA][nodeA]
+    end
+    if tags[idB] and tags[idB][nodeB] then
+      return idB, nodeB, idA, nodeA, tags[idB][nodeB]
+    end
+  end
+  local function walk(parentId)
+    if #out >= 3 then
+      return
+    end
+    for _, link in ipairs(core_vehicles.attachedCouplers) do
+      if type(link) == "table" and link[1] ~= link[2] then
+        local hitchId, hitchNode, childId, childNode, tag = hitchOf(link[1], link[3], link[2], link[4])
+        if hitchId == parentId and childId and childId ~= playerId and not seen[childId] then
+          seen[childId] = true
+          local obj = getObjectByID(childId)
+          local data = core_vehicle_manager and core_vehicle_manager.getVehicleData and core_vehicle_manager.getVehicleData(childId)
+          local config = data and data.config and (jsonClone(data.config) or data.config)
+          local model = obj and (obj.jbeam or obj.JBeam)
+          if not model and type(config) == "table" then
+            model = config.model
+          end
+          if model then
+            out[#out + 1] = {
+              model = model,
+              config = config,
+              parentNode = hitchNode,
+              childNode = childNode,
+              parentTag = tag,
+            }
+            log("I", "alpine_rt", "Trailer on the hitch: " .. tostring(model) .. " via " .. tostring(tag))
+            walk(childId)
+          end
+        end
+      end
+    end
+  end
+  walk(playerId)
+  return out[1] and out or nil
+end
+
+carry.tickTrailer = function()
+  local job = carry.trailerJob
+  if type(job) ~= "table" or not job[1] then
+    carry.trailerJob = nil
+    return
+  end
+  if now() < (carry.trailerAt or 0) then
+    return
+  end
+  local idx = carry.trailerIndex or 1
+  local row = job[idx]
+  if not row then
+    carry.trailerJob = nil
+    uiMsg("Trailer coupled", 4)
+    return
+  end
+  local parent = playerVehicle()
+  if idx > 1 then
+    parent = carry.trailerSpawned and getObjectByID(carry.trailerSpawned[idx - 1])
+  end
+  if not parent or not parent.getID then
+    return
+  end
+  local parentId = parent:getID()
+  if not row.spawnedId then
+    if not (core_vehicles and core_vehicles.spawnNewVehicle) then
+      carry.trailerJob = nil
+      return
+    end
+    local pos = parent:getPosition()
+    local rot = parent.getRotation and parent:getRotation() or quat(0, 0, 0, 1)
+    local spawned = core_vehicles.spawnNewVehicle(row.model, {
+      config = row.config,
+      pos = pos,
+      rot = rot,
+      autoEnterVehicle = false,
+      canSpawnAnotherVehicleCheck = false,
+      safeSpawn = false,
+      vehicleName = "alpine_rt_trailer" .. tostring(idx),
+    })
+    if type(spawned) == "table" and not spawned.getID and spawned[1] then
+      spawned = spawned[1]
+    end
+    local sid = spawned and spawned.getID and spawned:getID()
+    if not sid then
+      carry.trailerTries = (carry.trailerTries or 0) + 1
+      if carry.trailerTries > 20 then
+        log("W", "alpine_rt", "Trailer spawn failed for " .. tostring(row.model))
+        carry.trailerJob = nil
+      end
+      return
+    end
+    row.spawnedId = sid
+    carry.trailerSpawned = carry.trailerSpawned or {}
+    carry.trailerSpawned[idx] = sid
+    carry.trailerTries = 0
+    log("I", "alpine_rt", "Spawned trailer " .. tostring(row.model) .. " id=" .. tostring(sid))
+    return
+  end
+  local offsets = core_vehicles.vehsCouplerOffset
+  local parentOff = offsets and offsets[parentId] and offsets[parentId][row.parentNode]
+  local childOff = offsets and offsets[row.spawnedId] and offsets[row.spawnedId][row.childNode]
+  if not parentOff or not childOff or not (spawn and spawn.placeTrailer) then
+    carry.trailerTries = (carry.trailerTries or 0) + 1
+    if carry.trailerTries > 40 then
+      log("W", "alpine_rt", "Trailer hitch not ready for " .. tostring(row.model))
+      carry.trailerIndex = idx + 1
+      carry.trailerTries = 0
+      carry.trailerAt = now() + 0.2
+    end
+    return
+  end
+  spawn.placeTrailer(parentId, parentOff, row.spawnedId, childOff, row.parentTag)
+  if type(row.parentTag) == "string" and row.parentTag:match("^[%w_]+$")
+    and core_vehicles.couplerTagsOptions and core_vehicles.couplerTagsOptions[row.parentTag] ~= "autoCouple" then
+    parent:queueLuaCommand('beamstate.activateAutoCoupling("' .. row.parentTag .. '")')
+  end
+  log("I", "alpine_rt", "Trailer latched " .. tostring(row.model) .. " via " .. tostring(row.parentTag))
+  carry.trailerTries = 0
+  carry.trailerIndex = idx + 1
+  carry.trailerAt = now() + 0.4
+end
+
 local function yawToQuat(tx, ty)
   local dx, dy = tonumber(tx) or 1, tonumber(ty) or 0
   local n = math.sqrt(dx * dx + dy * dy)
@@ -1980,14 +2304,27 @@ local function teleportToArrive(arrive)
     return
   end
   local p = arrive.pos
-  local pos = vec3(p[1], p[2], p[3])
+  local pos = vec3(p[1], p[2], p[3] + 0.3)
   local t = arrive.tangent or { 1, 0 }
   local rot = yawToQuat(t[1], t[2])
-  if spawn and spawn.safeTeleport then
-    spawn.safeTeleport(veh, pos, rot)
-  else
-    veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
+  -- Same 180° the old safeTeleport applied. That search also walks the car off the road
+  -- when the arrival box touches a slope, so the portal point is used as-is.
+  rot = quat(0, 0, 1, 0) * rot
+  if veh.setClusterPosRelRot and veh.getClusterRotationSlow and veh.getRefNodeId then
+    local nodeId = veh:getRefNodeId()
+    local vehRot = quat(veh:getClusterRotationSlow(nodeId))
+    local diffRot = vehRot:inversed() * rot
+    veh:setClusterPosRelRot(nodeId, pos.x, pos.y, pos.z, diffRot.x, diffRot.y, diffRot.z, diffRot.w)
+    if veh.applyClusterVelocityScaleAdd then
+      veh:applyClusterVelocityScaleAdd(nodeId, 0, 0, 0, 0)
+    end
+    if veh.setOriginalTransform then
+      veh:setOriginalTransform(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
+    end
+    log("I", "alpine_rt", string.format("Arrive at portal %.1f %.1f %.1f", pos.x, pos.y, pos.z))
+    return
   end
+  veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
 end
 
 local function gatesForLevel(level)
@@ -2926,6 +3263,77 @@ local function dropStrayPrecip()
   end
 end
 
+-- The environment panel shows LevelInfo.fogDensity * 1000. UDW's native clear
+-- preset settles at 0.8 and overcast at 2, and that 6 s lerp starts from the
+-- map fog, which on these levels is often already around 2. Hold a lower cap
+-- across the lerp so a large level does not open in thick fog. Rain and snow
+-- keep the preset. A map that is already clearer is left alone.
+local FOG_CAP = {
+  sun = 0.49 / 1000,
+  clouds = 0.99 / 1000,
+}
+local FOG_CAP_HOLD_S = 12
+local fogCapMax = nil
+local fogCapUntil = 0
+
+local function levelInfoObj()
+  if scenetree and scenetree.theLevelInfo then
+    return scenetree.theLevelInfo
+  end
+  if scenetree and scenetree.findObject then
+    local named = scenetree.findObject("theLevelInfo")
+    if named then
+      return named
+    end
+  end
+  if scenetree and scenetree.findClassObjects then
+    local list = scenetree.findClassObjects("LevelInfo")
+    if list and list[1] and scenetree.findObject then
+      return scenetree.findObject(list[1])
+    end
+  end
+  return nil
+end
+
+local function clampLevelFog(maxFog)
+  if not maxFog then
+    return
+  end
+  local li = levelInfoObj()
+  if not li then
+    return
+  end
+  local have = tonumber(li.fogDensity)
+  if not have or have <= maxFog then
+    return
+  end
+  pcall(function()
+    li.fogDensity = maxFog
+    if li.postApply then
+      li:postApply()
+    end
+  end)
+end
+
+local function armFogCap(kind)
+  local maxFog = FOG_CAP[kind]
+  fogCapMax = maxFog
+  fogCapUntil = maxFog and (now() + FOG_CAP_HOLD_S) or 0
+  if not maxFog then
+    return
+  end
+  clampLevelFog(maxFog)
+  log("I", "alpine_rt", "fog cap " .. tostring(kind) .. " panel<=" .. string.format("%.2f", maxFog * 1000))
+end
+
+local function tickFogCap()
+  if not fogCapMax or now() > fogCapUntil then
+    fogCapMax = nil
+    return
+  end
+  clampLevelFog(fogCapMax)
+end
+
 local function applyForecast(kind)
   local spec = FORECAST_SKY[kind]
   if not spec then
@@ -2940,6 +3348,7 @@ local function applyForecast(kind)
     end
     dropStrayPrecip()
     pcall(jbw.setPreset, udwName, 6)
+    armFogCap(kind)
     log("I", "alpine_rt", "forecast weather " .. tostring(kind) .. " via UDW " .. udwName)
     return
   end
@@ -2960,6 +3369,7 @@ local function applyForecast(kind)
   if not ok then
     log("W", "alpine_rt", "forecast precip " .. tostring(err))
   end
+  armFogCap(kind)
   log("I", "alpine_rt", "forecast weather " .. tostring(kind))
 end
 
@@ -3066,11 +3476,20 @@ local function requestPartConditions()
   local token = carry.token
   carry.readyDamage = false
   carry.readyFuel = false
+  carry.readyOdo = false
+  carry.readyCargo = false
   carry.ready = false
+  local function publish()
+    carry.ready = carry.readyDamage and carry.readyFuel and carry.readyOdo and carry.readyCargo
+  end
   local veh = playerVehicle()
   if not veh or not core_vehicleBridge or not core_vehicleBridge.requestValue then
     carry.readyDamage = true
     carry.readyFuel = true
+    carry.readyOdo = true
+    carry.readyCargo = true
+    carry.odometer = false
+    carry.cargo = false
     carry.ready = true
     return
   end
@@ -3085,7 +3504,7 @@ local function requestPartConditions()
       carry.conditions = false
     end
     carry.readyDamage = true
-    carry.ready = carry.readyDamage and carry.readyFuel
+    publish()
   end, "getPartConditions")
   core_vehicleBridge.requestValue(veh, function(res)
     if token ~= carry.token then
@@ -3102,8 +3521,59 @@ local function requestPartConditions()
     end
     carry.fuel = fuel[1] and fuel or false
     carry.readyFuel = true
-    carry.ready = carry.readyDamage and carry.readyFuel
+    publish()
   end, "energyStorage")
+  -- Root reading in metres. Part wear stores the same number per part, but a
+  -- car with no damage sample used to spawn at 0.
+  core_vehicleBridge.requestValue(veh, function(res)
+    if token ~= carry.token then
+      return
+    end
+    local value = res and tonumber(res.result)
+    carry.odometer = value or false
+    carry.readyOdo = true
+    publish()
+  end, "getRootPartOdometer")
+  -- Container fill (bed, tank, bulk). Passenger seats are weight on the dummy
+  -- path. Cargo parts chosen in the vehicle config already ride along in that config.
+  core_vehicleBridge.requestValue(veh, function(res)
+    if token ~= carry.token then
+      return
+    end
+    local list = nil
+    if type(res) == "table" then
+      if type(res[1]) == "table" then
+        list = res[1]
+      elseif type(res.result) == "table" then
+        list = type(res.result[1]) == "table" and res.result[1] or res.result
+      end
+    end
+    local rows = {}
+    if type(list) == "table" then
+      for _, entry in ipairs(list) do
+        if type(entry) == "table" and entry.id ~= nil then
+          local passengersOnly = false
+          if type(entry.cargoTypes) == "table" and entry.cargoTypes[1] then
+            passengersOnly = true
+            for _, kind in ipairs(entry.cargoTypes) do
+              if kind ~= "passenger" then
+                passengersOnly = false
+                break
+              end
+            end
+          end
+          local volume = tonumber(entry.targetVolume) or tonumber(entry.currentVolume) or 0
+          local density = tonumber(entry.targetDensity) or tonumber(entry.currentDensity) or 1
+          if not passengersOnly and volume > 1e-3 then
+            rows[#rows + 1] = { id = entry.id, volume = volume, density = density }
+          end
+        end
+      end
+    end
+    carry.cargo = rows[1] and rows or false
+    carry.readyCargo = true
+    publish()
+  end, "getCargoContainers")
 end
 carry.request = requestPartConditions
 M.onCarrySaved = function()
@@ -3148,6 +3618,10 @@ local function queueSwitch(gate)
     if dummies[1] then
       carry.passengers = dummies
     end
+  end
+  carry.trailers = nil
+  if vehNow and vehNow.getID and carry.snapshotTrailers then
+    carry.trailers = carry.snapshotTrailers(vehNow:getID())
   end
   if vehNow and vehNow.queueLuaCommand then
     vehNow:queueLuaCommand('pcall(function() beamstate.save("settings/alpine_rt/vehicle_carry.json") end) obj:queueGameEngineLua("if extensions.alpinert and extensions.alpinert.onCarrySaved then extensions.alpinert.onCarrySaved() end")')
@@ -3196,6 +3670,13 @@ local function applyPendingRestore()
     restoreTries = restoreTries + 1
     return false
   end
+  if arcHomePos.restoreSpawn and setSpawnpoint and setSpawnpoint.setDefaultSP then
+    local back = arcHomePos.restoreSpawn
+    arcHomePos.restoreSpawn = nil
+    if type(back.name) == "string" and back.name ~= "" then
+      pcall(setSpawnpoint.setDefaultSP, back.name, back.level)
+    end
+  end
   local pending = session.pending_restore
   local level = currentLevel()
   if pending.to_level and level and pending.to_level ~= level then
@@ -3204,32 +3685,39 @@ local function applyPendingRestore()
     return true
   end
   applyClock(session.settings and session.settings.environment)
-  if session.vehicle and session.vehicle.model then
-    local veh = playerVehicle()
-    local needReplace = true
-    if veh and veh.jbeam == session.vehicle.model then
-      needReplace = false
-    end
-    if needReplace and core_vehicles and core_vehicles.replaceVehicle then
-      core_vehicles.replaceVehicle(session.vehicle.model, { config = session.vehicle.config })
-    end
-  end
   carry.damage = nil
   carry.fuelRestore = nil
+  carry.odometerRestore = nil
+  carry.cargoRestore = nil
   if session.vehicle and type(session.vehicle.partConditions) == "table" then
     carry.damage = session.vehicle.partConditions
   end
   if session.vehicle and type(session.vehicle.fuel) == "table" then
     carry.fuelRestore = session.vehicle.fuel
   end
+  if session.vehicle and tonumber(session.vehicle.odometer) then
+    carry.odometerRestore = tonumber(session.vehicle.odometer)
+  end
+  if session.vehicle and type(session.vehicle.cargo) == "table" then
+    carry.cargoRestore = session.vehicle.cargo
+  end
   carry.beamLoad = session.vehicle and session.vehicle.beamFile or nil
   carry.arrive = pending.arrive
   carry.passengersRestore = session.vehicle and type(session.vehicle.passengers) == "table" and session.vehicle.passengers or nil
-  if carry.damage or carry.fuelRestore or carry.beamLoad or carry.passengersRestore then
-    carry.damageTries = 0
-    carry.damageVid = nil
+  carry.trailerJob = nil
+  carry.trailerWaitReapply = nil
+  if session.vehicle and type(session.vehicle.trailers) == "table" and session.vehicle.trailers[1] then
+    carry.trailerJob = session.vehicle.trailers
+    carry.trailerIndex = 1
+    carry.trailerTries = 0
+    carry.trailerSpawned = nil
+    carry.trailerAt = nil
+    carry.trailerWaitReapply = true
   end
-  teleportToArrive(pending.arrive)
+  carry.reapplyStart = now()
+  carry.reapplyAt = now()
+  carry.reapplyShown = nil
+  carry.didReplace = nil
   if pending.weather then
     applyForecast(pending.weather)
     session.applied_weather = { level = pending.to_level or level, kind = pending.weather }
@@ -3238,15 +3726,13 @@ local function applyPendingRestore()
   end
   session.pending_restore = nil
   writeSession(session)
-  local grace = tonumber(portals.grace_s) or 8
-  graceUntil = now() + grace
+  graceUntil = now() + 28
   dwellGate = nil
   dwellAcc = 0
   dwellNeed = 0
   restoreArmed = false
   restoreTries = 0
-  uiMsg("Alpine Roadtrip: map loaded", 3)
-  log("I", "alpine_rt", "Restore done, grace " .. tostring(grace) .. "s")
+  log("I", "alpine_rt", "Spawn left to the game, reapply now")
   return true
 end
 
@@ -3352,10 +3838,14 @@ local function onClientEndMission()
   dwellAcc = 0
   dwellNeed = 0
   udwResumeLeft = nil
+  fogCapMax = nil
+  fogCapUntil = 0
   trafficSpawnedFor = nil
   trafficWait = 0
+  TEST_TRAFFIC._navLevel = nil
   fanRotors = nil
   userBoxIds = {}
+  arcHomePos.arriveLevel = nil
   waterStageFor = nil
   waterStageLevel = nil
   waterStageMonth = nil
@@ -3398,6 +3888,51 @@ local function ensureTestTraffic(level)
     end
     return
   end
+  -- Lane dashes are DecalRoads named line_* with hiddenInNavi. The navgraph still
+  -- treats them as roads, so traffic piles up on the nearest dash. Drop them once
+  -- per level, then only spawn when the closest road is the asphalt.
+  if TEST_TRAFFIC._navLevel ~= level then
+    local changed = 0
+    if scenetree and scenetree.findClassObjects then
+      for _, name in ipairs(scenetree.findClassObjects("DecalRoad")) do
+        local road = scenetree.findObject(name)
+        local marking = road and (road.hiddenInNavi or (type(name) == "string" and name:sub(1, 5) == "line_"))
+        local drv = road and tonumber(road.drivability)
+        if marking and (drv == nil or drv > 0) then
+          if road.setField then
+            road:setField("drivability", 0, "-1")
+          else
+            road.drivability = -1
+          end
+          changed = changed + 1
+        end
+      end
+    end
+    if changed > 0 and map.reset then
+      local okReset, errReset = pcall(map.reset)
+      log("I", "alpine_rt", "navgraph dropped " .. tostring(changed) .. " line markings ok=" .. tostring(okReset) .. " " .. tostring(errReset or ""))
+    end
+    TEST_TRAFFIC._navLevel = level
+  end
+  if carry.reapplyAt then
+    return
+  end
+  if map.findClosestRoad and map.getMap then
+    local veh = playerVehicle()
+    local pos = veh and veh.getPosition and veh:getPosition()
+    local n1, n2 = pos and map.findClosestRoad(pos)
+    local nodes = n1 and map.getMap().nodes
+    local a = nodes and nodes[n1]
+    local b = nodes and nodes[n2]
+    local radius = math.max(tonumber(a and a.radius) or 0, tonumber(b and b.radius) or 0)
+    local link = a and a.links and b and (a.links[n2] or (b.links and b.links[n1]))
+    if not n1 or radius < 2 or (link and link.hiddenInNavi) then
+      trafficSpawnedFor = level
+      log("W", "alpine_rt", "closest road is still a lane marking, radius=" .. tostring(radius) .. ", traffic not spawned")
+      uiMsg("Traffic left off, road graph is still the lane markings", 6)
+      return
+    end
+  end
   if not (gameplay_traffic and gameplay_traffic.setupTraffic) and extensions and extensions.load then
     pcall(extensions.load, "gameplay_traffic")
   end
@@ -3405,6 +3940,14 @@ local function ensureTestTraffic(level)
     trafficSpawnedFor = level
     log("W", "alpine_rt", "gameplay_traffic missing")
     return
+  end
+  if gameplay_traffic.getState then
+    local trafficState = gameplay_traffic.getState()
+    if trafficState == "loading" or trafficState == "spawning" or trafficState == "on" then
+      trafficSpawnedFor = level
+      log("I", "alpine_rt", "traffic already " .. tostring(trafficState) .. ", leaving that spawn alone")
+      return
+    end
   end
   trafficSpawnedFor = level
   -- 0.40 still takes (amount, {activeAmount}). The pause menu's parking count is a
@@ -3435,15 +3978,18 @@ local function onUpdate(dtReal, dtSim)
       if session and session.vehicle then
         session.vehicle.partConditions = cond
         session.vehicle.fuel = fuel
+        session.vehicle.odometer = tonumber(carry.odometer) or nil
+        session.vehicle.cargo = type(carry.cargo) == "table" and (jsonClone(carry.cargo) or carry.cargo) or nil
         session.vehicle.beamFile = carry.beamSaved and true or nil
         session.vehicle.passengers = type(carry.passengers) == "table" and (jsonClone(carry.passengers) or carry.passengers) or nil
+        session.vehicle.trailers = type(carry.trailers) == "table" and carry.trailers or nil
         writeSession(session)
       end
       if carry.hold.vehicle then
         carry.hold.vehicle.partConditions = cond
         carry.hold.vehicle.fuel = fuel
       end
-      log("I", "alpine_rt", "Carrying vehicle state damage=" .. tostring(cond ~= nil) .. " fuel=" .. tostring(fuel ~= nil) .. " beams=" .. tostring(carry.beamSaved == true) .. " passengers=" .. tostring(type(carry.passengers) == "table" and #carry.passengers or 0))
+      log("I", "alpine_rt", "Carrying vehicle state damage=" .. tostring(cond ~= nil) .. " fuel=" .. tostring(fuel ~= nil) .. " beams=" .. tostring(carry.beamSaved == true) .. " passengers=" .. tostring(type(carry.passengers) == "table" and #carry.passengers or 0) .. " odometer=" .. tostring(carry.odometer) .. " cargo=" .. tostring(type(carry.cargo) == "table" and #carry.cargo or 0) .. " trailers=" .. tostring(type(carry.trailers) == "table" and #carry.trailers or 0))
       switchQueued = {
         to_level = carry.hold.to_level,
         vehicle = carry.hold.vehicle,
@@ -3455,38 +4001,148 @@ local function onUpdate(dtReal, dtSim)
     end
     return
   end
-  if carry.damage or carry.fuelRestore or carry.beamLoad or carry.passengersRestore then
-    local veh = playerVehicle()
-    if veh then
-      local vid = veh.getID and veh:getID() or 0
-      if vid ~= carry.damageVid then
-        carry.damageVid = vid
-        carry.damageTries = 0
+  if carry.reapplyAt then
+    local left = math.ceil(carry.reapplyAt - now())
+    if left < 0 then
+      left = 0
+    end
+    if left ~= carry.reapplyShown then
+      carry.reapplyShown = left
+      if left > 0 then
+        uiMsg("Please wait! reapplying settings in " .. tostring(left) .. " s...", 1.2)
       end
-      local damage = carry.damage
-      local fuel = carry.fuelRestore
-      if core_vehicleBridge and core_vehicleBridge.executeAction then
-        pcall(function()
-          if type(damage) == "table" and carry.damageTries < 8 then
-            core_vehicleBridge.executeAction(veh, "initPartConditions", damage, 0, 1, 1)
-          end
-          if type(fuel) == "table" then
-            for _, row in ipairs(fuel) do
-              if type(row) == "table" and row.name and row.energy then
-                core_vehicleBridge.executeAction(veh, "setEnergyStorageEnergy", row.name, row.energy)
+    end
+    if now() >= carry.reapplyAt then
+      local trafficState = gameplay_traffic and gameplay_traffic.getState and gameplay_traffic.getState() or ""
+      local trafficBusy = trafficState == "loading" or trafficState == "spawning"
+      if trafficBusy and (now() - (carry.reapplyStart or now())) < 20 then
+        carry.reapplyAt = now() + 1
+        carry.reapplyShown = -1
+      else
+        local veh = playerVehicle()
+        local want = readSession()
+        want = want and want.vehicle
+        if veh and want and want.model and veh.jbeam ~= want.model and not carry.didReplace and core_vehicles and core_vehicles.replaceVehicle then
+          carry.didReplace = true
+          core_vehicles.replaceVehicle(want.model, { config = want.config })
+          carry.reapplyAt = now() + 2
+          carry.reapplyShown = -1
+        elseif veh then
+          local arrive = carry.arrive
+          local nearGate = nil
+          if arrive and arrive.pos then
+            local px, py = arrive.pos[1], arrive.pos[2]
+            local bestD = nil
+            for _, g in ipairs(gatesForLevel(currentLevel())) do
+              local b = g.box and g.box.pos
+              if b then
+                local dx, dy = px - b[1], py - b[2]
+                local d = dx * dx + dy * dy
+                if not bestD or d < bestD then
+                  bestD = d
+                  nearGate = g
+                end
+              end
+            end
+            local box = nearGate and nearGate.box
+            -- The gate tangent is not the road. On Imst the box sits ~22 m beside
+            -- the asphalt and ~6 m below it, so a 20 m step along that tangent
+            -- lands on the slope. Snap to the nearest decal centerline instead.
+            if box and box.pos and bestD and bestD < 80 * 80 then
+              if not arcHomePos.asphaltNear then
+                placeMovedBoxes(currentLevel())
+              end
+              if arcHomePos.asphaltNear then
+                local okRoad, roadArrive = pcall(arcHomePos.asphaltNear, box)
+                if okRoad and roadArrive then
+                  arrive = roadArrive
+                end
               end
             end
           end
-        end)
+          local already = false
+          if arrive and arrive.pos and veh.getPosition then
+            local vp = veh:getPosition()
+            local dx = vp.x - arrive.pos[1]
+            local dy = vp.y - arrive.pos[2]
+            local dz = vp.z - ((arrive.pos[3] or vp.z) + 0.3)
+            already = dx * dx + dy * dy + dz * dz < 4
+          end
+          if already then
+            log("I", "alpine_rt", "Already at the moved arrival, no second teleport")
+          else
+            teleportToArrive(arrive)
+          end
+          carry.arriveHold = nil
+          if nearGate and playerInGate(nearGate) then
+            carry.arriveHold = nearGate.id
+            uiMsg("Leave this portal once before it can send you back.", 6)
+          end
+          if core_vehicleBridge and core_vehicleBridge.executeAction then
+            pcall(function()
+              local odo = tonumber(carry.odometerRestore) or 0
+              -- false, not nil: a nil argument would drop the odometer off the call.
+              if type(carry.damage) == "table" or odo > 1 then
+                core_vehicleBridge.executeAction(veh, "initPartConditions", type(carry.damage) == "table" and carry.damage or false, odo, 1, 1)
+              end
+              if type(carry.fuelRestore) == "table" then
+                for _, row in ipairs(carry.fuelRestore) do
+                  if type(row) == "table" and row.name and row.energy then
+                    core_vehicleBridge.executeAction(veh, "setEnergyStorageEnergy", row.name, row.energy)
+                  end
+                end
+              end
+              if type(carry.cargoRestore) == "table" then
+                local payload = {}
+                for _, row in ipairs(carry.cargoRestore) do
+                  if type(row) == "table" and row.id ~= nil and type(row.volume) == "number" then
+                    local density = row.density
+                    if type(density) ~= "number" then
+                      density = 1
+                    end
+                    payload[row.id] = { containerId = row.id, volume = row.volume, density = density }
+                  end
+                end
+                if next(payload) then
+                  core_vehicleBridge.executeAction(veh, "setCargoContainers", payload, "updateExplicit")
+                end
+              end
+            end)
+          end
+          if carry.beamLoad and veh.queueLuaCommand then
+            veh:queueLuaCommand('pcall(function() beamstate.load("settings/alpine_rt/vehicle_carry.json") for _, c in pairs(controller.getControllersByType("advancedCouplerControl")) do if (not c.getGroupState or c.getGroupState() ~= "broken") and c.reset then c.reset() end end end)')
+          end
+          carry.latchUntil = now() + 2
+          carry.damage = nil
+          carry.fuelRestore = nil
+          carry.odometerRestore = nil
+          carry.cargoRestore = nil
+          carry.beamLoad = nil
+          carry.arrive = nil
+          carry.reapplyAt = nil
+          if carry.trailerWaitReapply then
+            carry.trailerWaitReapply = nil
+            carry.trailerAt = now() + 0.6
+          end
+          graceUntil = now() + (tonumber(portals.grace_s) or 8)
+          uiMsg("Settings restored", 3)
+          log("I", "alpine_rt", "Vehicle settings reapplied once")
+        else
+          carry.reapplyAt = now() + 1
+          carry.reapplyShown = -1
+        end
       end
-      if carry.beamLoad and veh.queueLuaCommand and (carry.damageTries == 8 or carry.damageTries == 16) then
-        veh:queueLuaCommand('pcall(function() beamstate.load("settings/alpine_rt/vehicle_carry.json") end)')
+    end
+  end
+  if carry.latchUntil then
+    local veh = playerVehicle()
+    if veh and now() < carry.latchUntil then
+      if veh.queueLuaCommand then
+        veh:queueLuaCommand('pcall(function() for _, c in pairs(controller.getControllersByType("advancedCouplerControl")) do if c.tryAttachGroupImpulse then c.tryAttachGroupImpulse() end end end)')
       end
-      if carry.arrive and (carry.damageTries == 10 or carry.damageTries == 18) then
-        teleportToArrive(carry.arrive)
-      end
-      if carry.passengersRestore and gameplay_seatOccupants and gameplay_seatOccupants.setDummyOccupant and carry.damageTries >= 12 then
-        local reseatId = vid
+      if carry.passengersRestore and gameplay_seatOccupants and gameplay_seatOccupants.setDummyOccupant and not carry.reseatOnce then
+        carry.reseatOnce = true
+        local reseatId = veh.getID and veh:getID() or 0
         local passengers = carry.passengersRestore
         pcall(function()
           for _, seat in ipairs(passengers) do
@@ -3494,23 +4150,27 @@ local function onUpdate(dtReal, dtSim)
               gameplay_seatOccupants.setDummyOccupant(reseatId, seat.seatId, seat.weight)
             end
           end
-          if core_vehicleBridge and core_vehicleBridge.executeAction then
-            core_vehicleBridge.executeAction(veh, "latchesClose")
+        end)
+      end
+    else
+      if veh and carry.passengersRestore and gameplay_seatOccupants and gameplay_seatOccupants.setDummyOccupant then
+        local reseatId = veh.getID and veh:getID() or 0
+        local passengers = carry.passengersRestore
+        pcall(function()
+          for _, seat in ipairs(passengers) do
+            if type(seat) == "table" and seat.seatId then
+              gameplay_seatOccupants.setDummyOccupant(reseatId, seat.seatId, seat.weight)
+            end
           end
         end)
       end
-      carry.damageTries = carry.damageTries + 1
-      if carry.damageTries >= 20 then
-        carry.damage = nil
-        carry.fuelRestore = nil
-        carry.beamLoad = nil
-        carry.arrive = nil
-        log("I", "alpine_rt", "Vehicle damage and fuel applied")
-      end
-      if carry.damageTries >= 36 then
-        carry.passengersRestore = nil
-      end
+      carry.latchUntil = nil
+      carry.passengersRestore = nil
+      carry.reseatOnce = nil
     end
+  end
+  if carry.trailerJob and carry.tickTrailer and not carry.trailerWaitReapply and not carry.reapplyAt and not carry.hold then
+    carry.tickTrailer()
   end
   if switchQueued then
     doQueuedSwitch()
@@ -3544,6 +4204,19 @@ local function onUpdate(dtReal, dtSim)
     log("E", "alpine_rt", "user box " .. tostring(errBox))
   end
   pcall(drawUserPortals, level)
+  if carry.arriveHold then
+    local held = nil
+    for _, g in ipairs(gatesForLevel(level)) do
+      if g.id == carry.arriveHold then
+        held = g
+        break
+      end
+    end
+    if not held or not playerInGate(held) then
+      log("I", "alpine_rt", "Arrival portal left, return allowed")
+      carry.arriveHold = nil
+    end
+  end
   if graceUntil > now() then
     hideAllArcs()
     return
@@ -3580,6 +4253,18 @@ local function onUpdate(dtReal, dtSim)
 
   if inside.user then
     ensureUserArc(inside)
+  end
+  if carry.arriveHold and inside.id == carry.arriveHold then
+    if inside.user then
+      drawGateArc(inside)
+    else
+      ensureLiveArc(inside)
+      drawGateArc(inside)
+    end
+    dwellGate = nil
+    dwellAcc = 0
+    dwellNeed = 0
+    return
   end
   if freshPortal.id and inside.id == freshPortal.id and now() < freshPortal.untilT then
     if inside.user then
@@ -3667,7 +4352,23 @@ local function onUpdate(dtReal, dtSim)
   end
 end
 
-local function onSerialize()
+M.onExtensionLoaded = onExtensionLoaded
+M.onWorldReadyState = onWorldReadyState
+M.onClientEndMission = onClientEndMission
+M.onClientCustomObjectSpawning = function(mission)
+  local ok, err = pcall(placeMovedBoxes, mission)
+  if not ok then
+    log("E", "alpine_rt", "arrival marker " .. tostring(err))
+  end
+end
+-- After core_weather, so the cap wins over its preset lerp (that hook writes
+-- LevelInfo fog on onPreRender for the whole transition).
+M.dependencies = { "core_weather" }
+M.onPreRender = function()
+  tickFogCap()
+end
+M.onUpdate = onUpdate
+M.onSerialize = function()
   return {
     dwellAcc = dwellAcc,
     dwellNeed = dwellNeed,
@@ -3675,8 +4376,7 @@ local function onSerialize()
     graceUntil = graceUntil,
   }
 end
-
-local function onDeserialized(data)
+M.onDeserialized = function(data)
   loadPortals()
   hideAllArcs()
   if type(data) == "table" then
@@ -3685,13 +4385,6 @@ local function onDeserialized(data)
     graceUntil = data.graceUntil or 0
   end
 end
-
-M.onExtensionLoaded = onExtensionLoaded
-M.onWorldReadyState = onWorldReadyState
-M.onClientEndMission = onClientEndMission
-M.onUpdate = onUpdate
-M.onSerialize = onSerialize
-M.onDeserialized = onDeserialized
 
 M.getTrafficMap = getTrafficMap
 M.defineLocation = defineLocation
