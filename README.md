@@ -2,6 +2,7 @@
 
 BeamNG.drive mod: Generating a region from several independant maps. Simulating a weather- and traffic system affecting the maps based on their geographical position. To switch from one map to the other, the driver can find their portal, which will take them to the next location once the driver spends the required amount of time in this portal. Time of day and the environmental configuration stay get recreated at the other end.
 
+[![First Look](https://img.youtube.com/vi/VUxwH3NRp6g/hqdefault.jpg)](https://youtu.be/VUxwH3NRp6g?si=h28mnGqQekxImRyQ)
 
 To generate enough maps in the same region quickly, maps themselves are built by [terrain-worker](https://github.com/decnet100/terrainWorker) using a semi-automated approach on 1m resolution terrain mapping, landcover, orthofoto. This repo is representing what is joining and connecting these maps: portal graph, GE extension, HUD, and the tools that inject the gates into those levels.
 
